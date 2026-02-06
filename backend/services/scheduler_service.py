@@ -26,7 +26,7 @@ def refresh_all_companies():
         from services.llm_service import analyze_sentiment_and_keywords, analyze_news_for_company
         from services.wordcloud_service import generate_wordcloud
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         cursor.execute("SELECT id, name FROM companies")
         companies = cursor.fetchall()
@@ -123,7 +123,7 @@ def refresh_all_companies():
 def refresh_macro_policy_digest():
     """使用大模型（联网）生成宏观政策摘要并写入 macro_policy_digest 表。返回 (成功, 消息)。"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE api_key IS NOT NULL AND api_key != '' LIMIT 1"
@@ -140,7 +140,7 @@ def refresh_macro_policy_digest():
         )
         if not result or not result.get('content'):
             return False, '大模型未返回有效摘要'
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO macro_policy_digest (title, content, updated_at) VALUES (?, ?, ?)",
@@ -157,7 +157,7 @@ def refresh_macro_policy_digest():
 def refresh_macro_policy_news():
     """多维度政策与市场新闻：联网搜索，每条单独写入 macro_policy_news 表。"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE api_key IS NOT NULL AND api_key != '' LIMIT 1"
@@ -176,7 +176,7 @@ def refresh_macro_policy_news():
         if not items:
             print('refresh_macro_policy_news: LLM 未返回条目')
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM macro_policy_news")
         now = datetime.now().isoformat()
@@ -202,7 +202,7 @@ def run_backup():
         dest = os.path.join(BACKUP_DIR, f'risk_platform_{stamp}.db')
         shutil.copy2(DB_PATH, dest)
         now_iso = datetime.now().strftime('%Y-%m-%d %H:%M')
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", ('last_backup', now_iso))
         conn.commit()
         conn.close()

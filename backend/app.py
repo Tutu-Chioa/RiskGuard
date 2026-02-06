@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 # 从 backend/.env 加载环境变量（MEDIACRAWLER_PATH、SECRET_KEY、SMTP 等），无需每次手动 export
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _env_path = os.path.join(_backend_dir, '.env')
+# 数据库路径与连接：统一 timeout 减少 "database is locked"
+_DB_PATH = os.path.join(os.path.dirname(_backend_dir), 'data', 'risk_platform.db')
+def _db_conn(path=None, timeout=30):
+    return sqlite3.connect(path or _DB_PATH, timeout=timeout)
 try:
     from dotenv import load_dotenv
     load_dotenv(_env_path)
@@ -208,12 +212,15 @@ def health():
 # Database initialization
 # 生产环境请设置 SKIP_DROP_TABLES=1 或 FLASK_ENV=production，仅执行迁移（加表/加列），不 DROP 表
 def init_db():
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'), timeout=30)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")  # 允许读与写并发，减轻 database is locked
     skip_drop = os.environ.get('SKIP_DROP_TABLES', '').strip() in ('1', 'true', 'yes') or os.environ.get('FLASK_ENV') == 'production'
 
     if not skip_drop:
-        # 开发环境：重建表并插入示例数据
+        # 开发环境：先删依赖 companies 的表，再删 companies，避免重启后「最新企业资讯」仍显示已删企业
+        for t in ('risk_alerts', 'company_media_reviews', 'company_news', 'company_keywords', 'user_company_favorites'):
+            cursor.execute("DROP TABLE IF EXISTS " + t)
         cursor.execute("DROP TABLE IF EXISTS risk_insights")
         cursor.execute("DROP TABLE IF EXISTS news_items")
         cursor.execute("DROP TABLE IF EXISTS documents")
@@ -525,6 +532,76 @@ def init_db():
             value TEXT
         )
     ''')
+    # 操作审计日志（谁在何时做了什么，便于合规）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            detail TEXT,
+            ip TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # 预警规则（可配置：风险升级、分类阈值、情感阈值等）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            rule_type TEXT NOT NULL,
+            config TEXT,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    try:
+        cursor.execute("ALTER TABLE companies ADD COLUMN tags TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # 站内通知
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT,
+            related_type TEXT,
+            related_id TEXT,
+            read_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # 任务执行记录（爬取/新闻搜索等）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_type TEXT NOT NULL,
+            company_id INTEGER,
+            status TEXT NOT NULL,
+            message TEXT,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP,
+            FOREIGN KEY (company_id) REFERENCES companies (id)
+        )
+    ''')
+    try:
+        cursor.execute("ALTER TABLE risk_alerts ADD COLUMN processed_at TIMESTAMP")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE company_news ADD COLUMN risk_dimensions TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 用户扩展设置与忘记密码
     for col, ctype in [
         ('alert_threshold', 'TEXT'), ('two_factor_enabled', 'INTEGER DEFAULT 0'),
@@ -584,9 +661,33 @@ def admin_required(f):
 
 
 def _user_company_ids(cursor, user_id):
-    """返回当前用户有权限的企业 id 列表（user_company_favorites），用于数据隔离。"""
-    cursor.execute("SELECT company_id FROM user_company_favorites WHERE user_id = ?", (user_id,))
+    """返回当前用户有权限且仍存在的企业 id 列表，用于数据隔离。只含 companies 表里仍存在的 id，避免删除/重建企业后仍显示其资讯。"""
+    cursor.execute("""SELECT u.company_id FROM user_company_favorites u
+                      INNER JOIN companies c ON c.id = u.company_id
+                      WHERE u.user_id = ?""", (user_id,))
     return [row[0] for row in cursor.fetchall()]
+
+
+def _audit_log(user_id, action, resource_type=None, resource_id=None, detail=None, cursor_=None, conn=None):
+    """写入操作审计日志。可传入已有 cursor/conn，否则新建连接。"""
+    ip = request.remote_addr if request else None
+    if cursor_ and conn:
+        try:
+            cursor_.execute("""INSERT INTO audit_log (user_id, action, resource_type, resource_id, detail, ip)
+                VALUES (?,?,?,?,?,?)""", (user_id, action, resource_type or '', str(resource_id) if resource_id is not None else '', detail or '', ip))
+            conn.commit()
+        except Exception:
+            pass
+        return
+    try:
+        c = _db_conn()
+        cur = c.cursor()
+        cur.execute("""INSERT INTO audit_log (user_id, action, resource_type, resource_id, detail, ip)
+            VALUES (?,?,?,?,?,?)""", (user_id, action, resource_type or '', str(resource_id) if resource_id is not None else '', detail or '', ip))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
 
 
 # 处理预检请求
@@ -656,6 +757,7 @@ def login():
         'role': role,
         'exp': datetime.utcnow() + timedelta(hours=24)
     }, app.config['SECRET_KEY'], algorithm="HS256")
+    _audit_log(user_id, 'login', 'user', user_id, '登录成功')
     return jsonify({
         'token': token,
         'user': {'id': user_id, 'username': uname, 'role': role}
@@ -760,6 +862,7 @@ def two_fa_disable(current_user_id):
         cur.execute("UPDATE users SET two_factor_enabled=0, two_factor_secret=NULL WHERE id=?", (current_user_id,))
         conn2.commit()
         conn2.close()
+        _audit_log(current_user_id, '2fa_disable', 'user', current_user_id, '两步验证已关闭')
         return jsonify({'message': '两步验证已关闭'})
     totp = pyotp.TOTP(row[0])
     if not totp.verify(code, valid_window=1):
@@ -769,6 +872,7 @@ def two_fa_disable(current_user_id):
     cursor.execute("UPDATE users SET two_factor_enabled=0, two_factor_secret=NULL WHERE id=?", (current_user_id,))
     conn.commit()
     conn.close()
+    _audit_log(current_user_id, '2fa_disable', 'user', current_user_id, '两步验证已关闭')
     return jsonify({'message': '两步验证已关闭'})
 
 
@@ -797,6 +901,7 @@ def two_fa_verify_login(current_user_id):
         'role': row[1],
         'exp': datetime.utcnow() + timedelta(hours=24)
     }, app.config['SECRET_KEY'], algorithm="HS256")
+    _audit_log(current_user_id, 'login', 'user', current_user_id, '2FA验证成功')
     return jsonify({
         'token': token,
         'user': {'id': current_user_id, 'username': row[0], 'role': row[1]}
@@ -1408,7 +1513,7 @@ def get_company(current_user_id, company_id):
                    c.legal_representative, c.registered_capital, c.business_status,
                    c.registered_address, c.business_scope, c.equity_structure,
                    c.social_evaluation, c.crawl_status, c.established_date,
-                   c.legal_cases, c.equity_changes, c.capital_changes, c.supplement_notes
+                   c.legal_cases, c.equity_changes, c.capital_changes, c.supplement_notes, c.tags
             FROM companies c
             WHERE c.id = ?
         """, (company_id,))
@@ -1418,7 +1523,7 @@ def get_company(current_user_id, company_id):
                    c.legal_representative, c.registered_capital, c.business_status,
                    c.registered_address, c.business_scope, c.equity_structure,
                    c.social_evaluation, c.crawl_status, c.established_date,
-                   c.legal_cases, c.equity_changes, c.capital_changes
+                   c.legal_cases, c.equity_changes, c.capital_changes, c.supplement_notes
             FROM companies c
             WHERE c.id = ?
         """, (company_id,))
@@ -1476,7 +1581,8 @@ def get_company(current_user_id, company_id):
         'legal_cases': company[14] if n > 14 else '',
         'equity_changes': company[15] if n > 15 else '',
         'capital_changes': company[16] if n > 16 else '',
-        'supplement_notes': company[17] if n > 17 else ''
+        'supplement_notes': company[17] if n > 17 else '',
+        'tags': company[18] if n > 18 else ''
     }
     
     # Get risk alerts for this company
@@ -1521,7 +1627,7 @@ def add_company(current_user_id):
     if not name:
         return jsonify({'message': 'Company name is required'}), 400
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = _db_conn()
     cursor = conn.cursor()
     
     try:
@@ -1535,27 +1641,28 @@ def add_company(current_user_id):
         conn.close()
         
         def _crawl_and_update():
-            db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
             try:
                 from services.crawler import fetch_company_info, trigger_media_crawl
-                from services.llm_service import analyze_sentiment_and_keywords, fetch_company_info_by_llm
-                conn2 = sqlite3.connect(db_path)
-                cur = conn2.cursor()
-                cur.execute("UPDATE companies SET llm_status='running', news_status='pending', media_status='pending' WHERE id=?", (company_id,))
-                conn2.commit()
-                cur.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
-                llm_row = cur.fetchone()
+                from services.llm_service import fetch_company_info_by_llm
+                # 步骤 0：更新状态，立即关闭连接，避免长时间持锁
+                c0 = _db_conn()
+                cur0 = c0.cursor()
+                cur0.execute("UPDATE companies SET llm_status='running', news_status='pending', media_status='pending' WHERE id=?", (company_id,))
+                cur0.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
+                llm_row = cur0.fetchone()
                 api_key = base_url = model = None
                 enable_web_search = False
                 if llm_row:
                     api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
                     enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
+                c0.commit()
+                c0.close()
                 if not api_key or not str(api_key).strip():
                     print('[工商信息] 未配置 LLM API，使用 enterprise_crawler 模拟数据')
                 else:
                     print('[工商信息] 使用 LLM 联网搜索，base_url=%s model=%s enable_web=%s' % (base_url or '(默认)', model, enable_web_search))
 
-                # 1) 企业工商、法律等信息：仅用大模型联网搜索，不用爬虫
+                # 1) 企业工商信息：先调 LLM/爬虫（不持库连接），再写库
                 from services.crawler import fetch_company_info
                 info = None
                 llm_ok = False
@@ -1580,7 +1687,9 @@ def add_company(current_user_id):
                     info = fetch_company_info(name)
                     print('[工商信息] 使用 enterprise_crawler 回退，info keys:', list(info.keys()) if info else 'None')
 
-                cur.execute("""UPDATE companies SET legal_representative=?, registered_capital=?, business_status=?,
+                c1 = _db_conn()
+                cur1 = c1.cursor()
+                cur1.execute("""UPDATE companies SET legal_representative=?, registered_capital=?, business_status=?,
                     registered_address=?, business_scope=?, equity_structure=?, established_date=?,
                     legal_cases=?, equity_changes=?, capital_changes=?,
                     industry=COALESCE(NULLIF(industry,''),?), crawl_status='crawled', llm_status=?, last_updated=? WHERE id=?""",
@@ -1588,68 +1697,79 @@ def add_company(current_user_id):
                      info.get('registered_address',''), info.get('business_scope',''), info.get('equity_structure',''),
                      info.get('established_date',''), info.get('legal_cases',''), info.get('equity_changes',''), info.get('capital_changes',''),
                      info.get('industry',''), 'success' if llm_ok or info else 'error', datetime.now().isoformat(), company_id))
-                conn2.commit()
+                c1.commit()
+                c1.close()
 
-                # 2) 大模型搜索相关新闻（自动化流程第二步）
-                cur.execute("UPDATE companies SET news_status='running' WHERE id=?", (company_id,))
-                conn2.commit()
+                # 2) 大模型搜索相关新闻：先请求（不持库），再写库
+                c2a = _db_conn()
+                c2a.cursor().execute("UPDATE companies SET news_status='running' WHERE id=?", (company_id,))
+                c2a.commit()
+                c2a.close()
                 news_ok = False
+                news_list = None
                 try:
                     if api_key and str(api_key).strip():
                         from services.llm_service import search_company_news
                         news_list = search_company_news(name, api_key, base_url or '', model or 'gpt-4o-mini', enable_web_search=enable_web_search)
-                        cur.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
-                        company_name_tag = (name or '').strip()
-                        for n in (news_list or []):
-                            rd = n.get('risk_dimensions') or {}
-                            rl = n.get('risk_level', '中')
-                            cur.execute("""INSERT INTO company_news (company_id, company_tag, title, content, source, sentiment_score, risk_level, category, publish_date, risk_dimensions)
-                                VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                                (company_id, company_name_tag, n.get('title', ''), n.get('summary', ''), n.get('source', ''),
-                                 0.5, rl, n.get('category', '其他'), n.get('date', ''),
-                                 json.dumps(rd, ensure_ascii=False)))
-                            if (rl or '').strip() == '高':
-                                _create_risk_alert(cur, company_id, 'news', 'high', (n.get('title') or '')[:200], n.get('source') or '')
-                        conn2.commit()
-                        news_ok = True
-                        print('[相关新闻] 已写入 %s 条' % len(news_list or []))
                 except Exception as ne:
                     print('[相关新闻] 搜索异常:', ne)
-                try:
-                    cur.execute("UPDATE companies SET news_status=? WHERE id=?", ('success' if news_ok else 'error', company_id))
-                    conn2.commit()
-                except sqlite3.OperationalError:
-                    pass
+                if news_list is not None:
+                    c2b = _db_conn()
+                    cur2 = c2b.cursor()
+                    cur2.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
+                    company_name_tag = (name or '').strip()
+                    for n in (news_list or []):
+                        rd = n.get('risk_dimensions') or {}
+                        rl = n.get('risk_level', '中')
+                        cur2.execute("""INSERT INTO company_news (company_id, company_tag, title, content, source, sentiment_score, risk_level, category, publish_date, risk_dimensions)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (company_id, company_name_tag, n.get('title', ''), n.get('summary', ''), n.get('source', ''),
+                             0.5, rl, n.get('category', '其他'), n.get('date', ''),
+                             json.dumps(rd, ensure_ascii=False)))
+                        if (rl or '').strip() == '高':
+                            _create_risk_alert(cur2, company_id, 'news', 'high', (n.get('title') or '')[:200], n.get('source') or '')
+                            _notify_alert_created(c2b, company_id, 'news', 'high', (n.get('title') or '')[:200], company_name_tag)
+                    cur2.execute("UPDATE companies SET news_status=? WHERE id=?", ('success', company_id))
+                    c2b.commit()
+                    c2b.close()
+                    news_ok = True
+                    print('[相关新闻] 已写入 %s 条' % len(news_list or []))
+                else:
+                    c2c = _db_conn()
+                    c2c.cursor().execute("UPDATE companies SET news_status=? WHERE id=?", ('error', company_id))
+                    c2c.commit()
+                    c2c.close()
 
-                # 3) 社会评价爬取（自动化流程第三步）
-                cur.execute("UPDATE companies SET social_evaluation=NULL WHERE id=?", (company_id,))
-                cur.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
-                cur.execute("UPDATE companies SET media_status='running' WHERE id=?", (company_id,))
-                conn2.commit()
+                # 3) 媒体舆情：仅更新状态并触发爬虫，回调里会单独连库
+                c3 = _db_conn()
+                cur3 = c3.cursor()
+                cur3.execute("UPDATE companies SET social_evaluation=NULL WHERE id=?", (company_id,))
+                cur3.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
+                cur3.execute("UPDATE companies SET media_status='running' WHERE id=?", (company_id,))
+                c3.commit()
+                c3.close()
 
                 def _save_reviews(cid, reviews):
                     from services.media_review_store import save_media_reviews_dedup
-                    save_media_reviews_dedup(db_path, cid, name, reviews, api_key, base_url, model)
+                    save_media_reviews_dedup(_DB_PATH, cid, name, reviews, api_key, base_url, model)
                 def _on_media_error(cid):
-                    c = sqlite3.connect(db_path)
-                    cu = c.cursor()
-                    cu.execute("UPDATE companies SET media_status='error' WHERE id=?", (cid,))
-                    c.commit()
-                    c.close()
+                    cx = _db_conn()
+                    cx.cursor().execute("UPDATE companies SET media_status='error' WHERE id=?", (cid,))
+                    cx.commit()
+                    cx.close()
                 trigger_media_crawl(company_id, name, callback=_save_reviews, on_error=_on_media_error)
-                conn2.close()
             except Exception as e:
                 print('Crawl error:', e)
                 try:
-                    c = sqlite3.connect(db_path)
-                    cu = c.cursor()
+                    cx = _db_conn()
+                    cu = cx.cursor()
                     for col, val in [('llm_status', 'error'), ('media_status', 'error'), ('news_status', 'error')]:
                         try:
                             cu.execute("UPDATE companies SET %s=? WHERE id=?" % col, (val, company_id))
                         except sqlite3.OperationalError:
                             pass
-                    c.commit()
-                    c.close()
+                    cx.commit()
+                    cx.close()
                 except Exception:
                     pass
         
@@ -1689,7 +1809,7 @@ def update_company(current_user_id, company_id):
         return jsonify({'message': 'Company not found'}), 404
     cols = []
     vals = []
-    for k in ['name','industry','risk_level','legal_representative','registered_capital','business_status','registered_address','business_scope','equity_structure','social_evaluation','established_date']:
+    for k in ['name','industry','risk_level','legal_representative','registered_capital','business_status','registered_address','business_scope','equity_structure','social_evaluation','established_date','tags','supplement_notes']:
         if k in data:
             cols.append(k + '=?')
             vals.append(data[k])
@@ -1702,7 +1822,9 @@ def update_company(current_user_id, company_id):
         cursor.execute("UPDATE companies SET " + ', '.join(cols) + ", last_updated=? WHERE id=?", vals + [datetime.now().isoformat(), company_id])
         if old_level is not None and old_level != '高':
             _create_risk_alert(cursor, company_id, 'company', 'high', '企业风险等级调整为高风险', 'user_edit')
+            _notify_alert_created(conn, company_id, 'company', 'high', '企业风险等级调整为高风险')
     conn.commit()
+    _audit_log(current_user_id, 'update_company', 'company', company_id, None, cursor_=cursor, conn=conn)
     conn.close()
     return jsonify({'message': '更新成功'})
 
@@ -1742,6 +1864,9 @@ def delete_company(current_user_id, company_id):
         logger.info('Company delete denied: user_id=%s company_id=%s', current_user_id, company_id)
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
+    cursor.execute("SELECT name FROM companies WHERE id=?", (company_id,))
+    row = cursor.fetchone()
+    company_name = row[0] if row else str(company_id)
     # 与公司严格绑定：删除该公司相关的警报、媒体评价、相关资讯、关键词，再删公司
     cursor.execute("DELETE FROM risk_alerts WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
@@ -1750,6 +1875,7 @@ def delete_company(current_user_id, company_id):
     cursor.execute("DELETE FROM user_company_favorites WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM companies WHERE id=?", (company_id,))
     conn.commit()
+    _audit_log(current_user_id, 'delete_company', 'company', company_id, company_name, cursor_=cursor, conn=conn)
     conn.close()
     return jsonify({'message': '删除成功'})
 
@@ -1867,12 +1993,19 @@ def search_company_news_api(current_user_id, company_id):
         return jsonify({'message': '请先在系统设置中配置 LLM API 并开启联网搜索'}), 400
     api_key, base_url, model = llm_row[0], llm_row[1] or '', llm_row[2] or 'gpt-4o-mini'
     enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
+    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    conn0 = _db_conn()
+    cur0 = conn0.cursor()
+    cur0.execute("INSERT INTO task_runs (task_type, company_id, status, message) VALUES (?,?,?,?)", ('news_search', company_id, 'running', '大模型搜索相关新闻'))
+    conn0.commit()
+    task_run_id = cur0.lastrowid
+    conn0.close()
     try:
         from services.llm_service import search_company_news
         news_list = search_company_news(row[0], api_key, base_url, model, enable_web_search=enable_web_search)
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
         conn2 = sqlite3.connect(db_path)
         cur = conn2.cursor()
+        cur.execute("UPDATE task_runs SET status=?, message=?, finished_at=? WHERE id=?", ('success', f'共{len(news_list)}条', datetime.utcnow().isoformat(), task_run_id))
         # 严格替换：先清空该企业原有相关新闻，再写入本次搜索结果，避免在原基础上追加导致混入别家/旧数据
         cur.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
         company_name_tag = (row[0] or '').strip()
@@ -1886,6 +2019,7 @@ def search_company_news_api(current_user_id, company_id):
                  json.dumps(rd, ensure_ascii=False)))
             if (rl or '').strip() == '高':
                 _create_risk_alert(cur, company_id, 'news', 'high', (n.get('title') or '')[:200], n.get('source') or '')
+                _notify_alert_created(conn2, company_id, 'news', 'high', (n.get('title') or '')[:200])
         try:
             cur.execute("UPDATE companies SET news_status='success' WHERE id=?", (company_id,))
         except sqlite3.OperationalError:
@@ -1895,6 +2029,10 @@ def search_company_news_api(current_user_id, company_id):
         return jsonify({'message': f'已更新该企业相关新闻，共 {len(news_list)} 条', 'count': len(news_list), 'news': news_list})
     except Exception as e:
         import traceback
+        conn_err = _db_conn()
+        conn_err.cursor().execute("UPDATE task_runs SET status=?, message=?, finished_at=? WHERE id=?", ('error', str(e)[:200], datetime.utcnow().isoformat(), task_run_id))
+        conn_err.commit()
+        conn_err.close()
         print('News search error:', traceback.format_exc())
         return jsonify({'message': str(e)}), 500
 
@@ -1904,8 +2042,12 @@ def clear_company_news(current_user_id, company_id):
     """清空该企业全部相关新闻（按企业专属标签：只删本企业标签的新闻，或按 company_id 全删）"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = _db_conn()
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
     cursor.execute("SELECT name FROM companies WHERE id=?", (company_id,))
     row = cursor.fetchone()
     if not row:
@@ -1915,6 +2057,7 @@ def clear_company_news(current_user_id, company_id):
     cursor.execute("DELETE FROM company_news WHERE company_id=? AND (company_tag IS NULL OR company_tag=?)", (company_id, company_name))
     deleted = cursor.rowcount
     conn.commit()
+    _audit_log(current_user_id, 'clear_company_news', 'company', company_id, f'清空{deleted}条', cursor_=cursor, conn=conn)
     conn.close()
     return jsonify({'message': f'已清空该企业相关新闻，共删除 {deleted} 条', 'deleted': deleted})
 
@@ -1923,8 +2066,12 @@ def clear_company_news(current_user_id, company_id):
 def export_company_report(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = _db_conn()
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
     cursor.execute("""SELECT name, industry, risk_level, legal_representative, registered_capital, business_status,
         registered_address, business_scope, equity_structure, social_evaluation, established_date, last_updated
         FROM companies WHERE id=?""", (company_id,))
@@ -1962,6 +2109,7 @@ def export_company_report(current_user_id, company_id):
         lines.append(f'    {r[2][:200]}...' if len(r[2] or '') > 200 else f'    {r[2] or ""}')
     lines.extend(['', '=' * 60, f'报告生成时间：{datetime.now().isoformat()}', '=' * 60])
     text = '\n'.join(lines)
+    _audit_log(current_user_id, 'export_report', 'company', company_id, 'TXT')
     from flask import Response
     return Response(text, mimetype='text/plain; charset=utf-8',
         headers={'Content-Disposition': f'attachment; filename=report_{company_id}.txt'})
@@ -1981,8 +2129,12 @@ def export_company_excel(current_user_id, company_id):
     from flask import send_file
     import io
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
-    conn = sqlite3.connect(db_path)
+    conn = _db_conn()
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
     cursor.execute("""SELECT name, industry, risk_level, legal_representative, registered_capital, business_status,
         registered_address, business_scope, equity_structure, social_evaluation, established_date, last_updated, supplement_notes
         FROM companies WHERE id=?""", (company_id,))
@@ -2046,8 +2198,80 @@ def export_company_excel(current_user_id, company_id):
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
+    _audit_log(current_user_id, 'export_report', 'company', company_id, 'Excel')
     return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         as_attachment=True, download_name=f'report_{company_id}.xlsx')
+
+
+@app.route('/api/companies/<int:company_id>/export-pdf', methods=['GET', 'OPTIONS'])
+@token_required
+def export_company_pdf(current_user_id, company_id):
+    """导出企业报告为 PDF"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return jsonify({'message': '服务端未安装 reportlab，请使用 TXT 或 Excel 导出'}), 503
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
+    cursor.execute("""SELECT name, industry, risk_level, legal_representative, registered_capital, business_status,
+        registered_address, business_scope, equity_structure, social_evaluation, established_date, last_updated, supplement_notes
+        FROM companies WHERE id=?""", (company_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'message': 'Company not found'}), 404
+    cursor.execute("SELECT platform, title, content, sentiment FROM company_media_reviews WHERE company_id=?", (company_id,))
+    reviews = cursor.fetchall()
+    cursor.execute("SELECT title, content, source, risk_level, category FROM company_news WHERE company_id=? ORDER BY created_at DESC LIMIT 50", (company_id,))
+    news_rows = cursor.fetchall()
+    conn.close()
+    supplement_notes = row[12] if len(row) > 12 else ''
+    from flask import send_file
+    import io
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    y = height - 40
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, f"Enterprise Risk Report - {row[0] or ''}")
+    y -= 30
+    c.setFont("Helvetica", 10)
+    blocks = [
+        ("Basic Info", [
+            f"Name: {row[0] or '-'}", f"Industry: {row[1] or '-'}", f"Risk Level: {row[2] or '-'}",
+            f"Legal Rep: {row[3] or '-'}", f"Capital: {row[4] or '-'}", f"Status: {row[5] or '-'}",
+            f"Address: {row[6] or '-'}", f"Scope: {(row[7] or '-')[:200]}", f"Social: {row[9] or '-'}",
+            f"Updated: {row[11] or '-'}", f"Supplement: {(supplement_notes or '-')[:300]}"
+        ]),
+        ("Media", [f"[{r[0]}] {r[1]} - {r[3]}" for r in reviews[:20]]),
+        ("News", [f"{r[0]} | {r[2]} | {r[4]}" for r in news_rows[:15]])
+    ]
+    for title, lines in blocks:
+        y -= 20
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(50, y, title)
+        y -= 18
+        c.setFont("Helvetica", 9)
+        for line in lines:
+            if y < 50:
+                c.showPage()
+                y = height - 40
+            c.drawString(55, y, (line or '')[:90])
+            y -= 14
+    c.drawString(50, 30, f"Generated: {datetime.now().isoformat()}")
+    c.save()
+    buf.seek(0)
+    _audit_log(current_user_id, 'export_report', 'company', company_id, 'PDF')
+    return send_file(buf, mimetype='application/pdf', as_attachment=True, download_name=f'report_{company_id}.pdf')
 
 
 @app.route('/api/llm-config', methods=['GET', 'OPTIONS'])
@@ -2553,28 +2777,29 @@ def get_dashboard(current_user_id):
 @app.route('/api/dashboard/trend', methods=['GET', 'OPTIONS'])
 @token_required
 def get_dashboard_trend(current_user_id):
-    """近7天每日资讯数量趋势（用于图表），仅统计当前用户企业下的资讯"""
+    """近 N 天每日资讯数量趋势（用于图表），仅统计当前用户企业下的资讯。支持 ?days=7|30|90"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    days = min(90, max(1, int(request.args.get('days', 7))))
+    conn = _db_conn()
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
         conn.close()
         today = datetime.now().date()
-        trend = [{'date': (today - timedelta(days=i)).isoformat(), 'count': 0, 'label': ['一','二','三','四','五','六','日'][(today - timedelta(days=i)).weekday()]} for i in range(6, -1, -1)]
+        trend = [{'date': (today - timedelta(days=days-1-i)).isoformat(), 'count': 0, 'label': ['一','二','三','四','五','六','日'][(today - timedelta(days=days-1-i)).weekday()]} for i in range(days)]
         return jsonify({'trend': trend})
     placeholders = ','.join('?' * len(cids))
     cursor.execute("""SELECT date(created_at) as d, COUNT(*) FROM company_news 
-        WHERE company_id IN (""" + placeholders + """) AND created_at > datetime('now','-7 day') GROUP BY date(created_at) ORDER BY d""", tuple(cids))
+        WHERE company_id IN (""" + placeholders + """) AND created_at > datetime('now','-""" + str(days) + """ day') GROUP BY date(created_at) ORDER BY d""", tuple(cids))
     rows = cursor.fetchall()
     conn.close()
     day_map = {r[0]: r[1] for r in rows}
     today = datetime.now().date()
     trend = []
-    for i in range(6, -1, -1):
-        d = (today - timedelta(days=i)).isoformat()
-        trend.append({'date': d, 'count': day_map.get(d, 0), 'label': ['一','二','三','四','五','六','日'][(today - timedelta(days=i)).weekday()]})
+    for i in range(days):
+        d = (today - timedelta(days=days-1-i)).isoformat()
+        trend.append({'date': d, 'count': day_map.get(d, 0), 'label': ['一','二','三','四','五','六','日'][(today - timedelta(days=days-1-i)).weekday()]})
     return jsonify({'trend': trend})
 
 
@@ -2604,17 +2829,20 @@ def get_dashboard_risk_distribution(current_user_id):
 @app.route('/api/dashboard/category-distribution', methods=['GET', 'OPTIONS'])
 @token_required
 def get_dashboard_category_distribution(current_user_id):
-    """资讯分类分布（用于仪表盘图表），仅统计当前用户企业下的资讯"""
+    """资讯分类分布（用于仪表盘图表），仅统计当前用户企业下的资讯。支持 ?days=7|30|90"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    days = min(90, max(1, int(request.args.get('days', 30))))
+    conn = _db_conn()
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
         conn.close()
         return jsonify([])
     placeholders = ','.join('?' * len(cids))
-    cursor.execute("SELECT category, COUNT(*) FROM company_news WHERE company_id IN (" + placeholders + ") AND category IS NOT NULL AND category != '' GROUP BY category ORDER BY COUNT(*) DESC", tuple(cids))
+    cursor.execute("""SELECT category, COUNT(*) FROM company_news 
+        WHERE company_id IN (""" + placeholders + """) AND category IS NOT NULL AND category != '' AND created_at > datetime('now','-""" + str(days) + """ day') 
+        GROUP BY category ORDER BY COUNT(*) DESC""", tuple(cids))
     rows = cursor.fetchall()
     conn.close()
     return jsonify([{'category': r[0], 'count': r[1]} for r in rows])
@@ -2674,6 +2902,10 @@ def get_company_supplements(current_user_id, company_id):
         return jsonify({})
     conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限访问该企业'}), 403
     cursor.execute("SELECT id FROM companies WHERE id=?", (company_id,))
     if not cursor.fetchone():
         conn.close()
@@ -2702,6 +2934,10 @@ def supplement_chat(current_user_id, company_id):
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
     cursor.execute(
         "SELECT name, legal_representative, registered_capital, business_status, registered_address, business_scope, social_evaluation, supplement_notes FROM companies WHERE id=?",
         (company_id,)
@@ -2747,6 +2983,49 @@ def supplement_chat(current_user_id, company_id):
     conn.commit()
     conn.close()
     return jsonify({'message': '已归集', 'summary': summary, 'updates': updates})
+
+
+@app.route('/api/companies/<int:company_id>/ask', methods=['POST', 'OPTIONS'])
+@token_required
+def ask_company(current_user_id, company_id):
+    """问这家企业：基于企业上下文（基本信息、新闻、尽调补充）用 LLM 回答用户问题。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    question = (data.get('question') or data.get('text') or '').strip()
+    if not question:
+        return jsonify({'message': '请输入问题'}), 400
+    if len(question) > 500:
+        return jsonify({'message': '问题不超过 500 字'}), 400
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
+    cursor.execute("""SELECT name, industry, risk_level, legal_representative, registered_capital, business_status,
+        registered_address, business_scope, social_evaluation, supplement_notes
+        FROM companies WHERE id=?""", (company_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'message': 'Company not found'}), 404
+    name = row[0]
+    context_parts = [f"企业：{name}", f"行业：{row[1] or '-'}", f"风险等级：{row[2] or '-'}", f"法人：{row[3] or '-'}", f"注册资本：{row[4] or '-'}", f"经营状态：{row[5] or '-'}", f"社会评价：{row[8] or '-'}", f"尽调备注：{row[9] or '-'}"]
+    cursor.execute("SELECT title, content, source, risk_level, category FROM company_news WHERE company_id=? ORDER BY created_at DESC LIMIT 30", (company_id,))
+    for r in cursor.fetchall():
+        context_parts.append(f"新闻：{r[0] or ''} | {r[2] or ''} | 风险:{r[3] or '-'} | {(r[1] or '')[:150]}")
+    cursor.execute("SELECT role, content FROM company_supplements WHERE company_id=? ORDER BY created_at DESC LIMIT 20", (company_id,))
+    for r in cursor.fetchall():
+        context_parts.append(f"补充({r[0]}): {(r[1] or '')[:200]}")
+    cursor.execute("SELECT api_key, base_url, model FROM llm_config WHERE user_id=?", (current_user_id,))
+    llm_row = cursor.fetchone()
+    conn.close()
+    if not llm_row or not (llm_row[0] and str(llm_row[0]).strip()):
+        return jsonify({'message': '请先在系统设置中配置 LLM API Key'}), 400
+    from services.llm_service import ask_company_question
+    result = ask_company_question(name, '\n'.join(context_parts), question, llm_row[0], llm_row[1] or '', llm_row[2] or 'gpt-4o-mini')
+    return jsonify(result)
 
 
 @app.route('/api/settings/search-interval', methods=['GET', 'OPTIONS'])
@@ -2817,6 +3096,7 @@ def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
                  json.dumps(rd, ensure_ascii=False)))
             if (rl or '').strip() == '高':
                 _create_risk_alert(cur, cid, 'news', 'high', (title or url[:100] or '')[:200], '用户链接')
+                _notify_alert_created(conn, cid, 'news', 'high', (title or url[:100] or '')[:200])
             cur.execute("INSERT INTO company_media_reviews (company_id, platform, title, content, sentiment) VALUES (?,?,?,?,?)",
                 (cid, '用户链接', title or url[:100], result.get('summary',''), 'neutral' if float(result.get('sentiment_score',0))>=0 else 'negative'))
             if api_key:
@@ -2827,6 +3107,7 @@ def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
                 cur.execute("UPDATE companies SET social_evaluation=?, risk_level=? WHERE id=?", (res.get('summary',''), res.get('risk_level',''), cid))
                 if (res.get('risk_level') or '').strip() == '高':
                     _create_risk_alert(cur, cid, 'company', 'high', '企业风险等级升至高风险', 'link_analysis')
+                    _notify_alert_created(conn, cid, 'company', 'high', '企业风险等级升至高风险')
                 for kw in res.get('keywords', [])[:10]:
                     cur.execute("INSERT OR IGNORE INTO company_keywords (company_id, keyword, weight) VALUES (?,?,1)", (cid, kw))
         conn.commit()
@@ -2892,45 +3173,119 @@ def _create_risk_alert(cursor, company_id, alert_type, severity, description, so
     except sqlite3.OperationalError:
         pass
 
+
+def _notify_alert_created(conn, company_id, alert_type, severity, description, company_name=None):
+    """风险警报产生后：给收藏了该企业的用户创建站内通知，并根据预警规则发邮件。"""
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        if company_name is None:
+            cur.execute("SELECT name FROM companies WHERE id=?", (company_id,))
+            r = cur.fetchone()
+            company_name = r[0] if r else ''
+        cur.execute("SELECT user_id FROM user_company_favorites WHERE company_id=?", (company_id,))
+        user_ids = [row[0] for row in cur.fetchall()]
+        title = f"风险警报：{company_name or ('企业#' + str(company_id))}"
+        body = (description or '')[:500]
+        rule_types_ok = ('new_alert', 'risk_upgrade')
+        for uid in user_ids:
+            cur.execute("SELECT id FROM alert_rules WHERE user_id=? AND enabled=1 AND rule_type IN (?,?)", (uid, 'new_alert', 'risk_upgrade'))
+            if not cur.fetchone():
+                continue
+            cur.execute("""INSERT INTO notifications (user_id, type, title, body, related_type, related_id)
+                VALUES (?,?,?,?,?,?)""", (uid, 'risk_alert', title, body, 'company', str(company_id)))
+            send_email_to_user(uid, title, body + '\n\n请登录系统查看详情。')
+        conn.commit()
+    except Exception as e:
+        logger.warning('_notify_alert_created: %s', e)
+
+
 # Risk alerts routes
 @app.route('/api/alerts', methods=['GET', 'OPTIONS'])
 @token_required
 def get_alerts(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-        
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    severity_filter = request.args.get('severity', '').strip().lower()
+    conn = _db_conn()
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
         conn.close()
         return jsonify([])
     placeholders = ','.join('?' * len(cids))
-    cursor.execute("""
+    sql = """
         SELECT ra.id, ra.company_id, ra.alert_type, ra.severity, ra.description, ra.source, ra.timestamp,
                c.name as company_name
         FROM risk_alerts ra
         JOIN companies c ON ra.company_id = c.id
         WHERE ra.company_id IN (""" + placeholders + """)
-        ORDER BY ra.timestamp DESC
-        LIMIT 50
-    """, tuple(cids))
-    
-    alerts = []
-    for row in cursor.fetchall():
-        alerts.append({
-            'id': row[0],
-            'company_id': row[1],
-            'alert_type': row[2],
-            'severity': row[3],
-            'description': row[4],
-            'source': row[5],
-            'timestamp': row[6],
-            'company_name': row[7]
-        })
-    
+    """
+    params = list(cids)
+    try:
+        sql = sql.replace("ra.timestamp,", "ra.timestamp, ra.processed_at,")
+        sql += " ORDER BY ra.timestamp DESC LIMIT 50"
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+        alerts = []
+        for row in rows:
+            alerts.append({
+                'id': row[0],
+                'company_id': row[1],
+                'alert_type': row[2],
+                'severity': row[3],
+                'description': row[4],
+                'source': row[5],
+                'timestamp': row[6],
+                'processed_at': row[7] if len(row) > 7 else None,
+                'company_name': row[8] if len(row) > 8 else row[7]
+            })
+    except sqlite3.OperationalError:
+        sql = """
+            SELECT ra.id, ra.company_id, ra.alert_type, ra.severity, ra.description, ra.source, ra.timestamp,
+                   c.name as company_name
+            FROM risk_alerts ra
+            JOIN companies c ON ra.company_id = c.id
+            WHERE ra.company_id IN (""" + placeholders + """)
+            ORDER BY ra.timestamp DESC
+            LIMIT 50
+        """
+        cursor.execute(sql, tuple(cids))
+        alerts = [{'id': row[0], 'company_id': row[1], 'alert_type': row[2], 'severity': row[3], 'description': row[4],
+                   'source': row[5], 'timestamp': row[6], 'company_name': row[7], 'processed_at': None} for row in cursor.fetchall()]
     conn.close()
+    if severity_filter and severity_filter in ('high', '中', '高', 'medium', '低', 'low'):
+        sev_map = {'high': ('高', 'high'), 'medium': ('中', 'medium'), 'low': ('低', 'low'), '中': ('中', 'medium'), '高': ('高', 'high'), '低': ('低', 'low')}
+        want_tuple = sev_map.get(severity_filter, (severity_filter,))
+        alerts = [a for a in alerts if (a.get('severity') or '') in want_tuple or (a.get('severity') or '').lower() == severity_filter]
     return jsonify(alerts)
+
+
+@app.route('/api/alerts/<int:alert_id>', methods=['PATCH', 'OPTIONS'])
+@token_required
+def mark_alert_processed(current_user_id, alert_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cids = _user_company_ids(cursor, current_user_id)
+    if not cids:
+        conn.close()
+        return jsonify({'message': '无权限'}), 403
+    placeholders = ','.join('?' * len(cids))
+    cursor.execute("SELECT id FROM risk_alerts WHERE id=? AND company_id IN (" + placeholders + ")", (alert_id,) + tuple(cids))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '警报不存在或无权限'}), 404
+    try:
+        cursor.execute("UPDATE risk_alerts SET processed_at=? WHERE id=?", (datetime.utcnow().isoformat(), alert_id))
+    except sqlite3.OperationalError:
+        conn.close()
+        return jsonify({'message': '当前版本不支持标记已处理'}), 501
+    conn.commit()
+    conn.close()
+    return jsonify({'message': '已标记为已处理'})
 
 def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_id):
     """后台分析文档并归类到企业、写入资讯"""
@@ -2967,6 +3322,7 @@ def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_
                  json.dumps(rd, ensure_ascii=False)))
             if (rl or '').strip() == '高':
                 _create_risk_alert(cur, cid, 'news', 'high', (filename or '文档')[:200], '用户上传')
+                _notify_alert_created(conn, cid, 'news', 'high', (filename or '文档')[:200])
             cur.execute("INSERT INTO company_media_reviews (company_id, platform, title, content, sentiment) VALUES (?,?,?,?,?)",
                 (cid, '用户文档', filename, result.get('summary','')[:500], 'neutral' if float(result.get('sentiment_score',0))>=0 else 'negative'))
             if api_key:
@@ -2977,6 +3333,7 @@ def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_
                 cur.execute("UPDATE companies SET social_evaluation=?, risk_level=? WHERE id=?", (res.get('summary',''), res.get('risk_level',''), cid))
                 if (res.get('risk_level') or '').strip() == '高':
                     _create_risk_alert(cur, cid, 'company', 'high', '企业风险等级升至高风险', 'document_analysis')
+                    _notify_alert_created(conn, cid, 'company', 'high', '企业风险等级升至高风险')
                 for kw in res.get('keywords', [])[:10]:
                     cur.execute("INSERT OR IGNORE INTO company_keywords (company_id, keyword, weight) VALUES (?,?,1)", (cid, kw))
         conn.commit()
@@ -3057,9 +3414,11 @@ def upload_document(current_user_id):
 @app.route('/api/risk-indicators', methods=['GET', 'OPTIONS'])
 @token_required
 def get_risk_indicators(current_user_id):
+    """风险指标（按分类聚合），支持 ?days=7|30|90"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    days = min(90, max(1, int(request.args.get('days', 30))))
+    conn = _db_conn()
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
@@ -3067,7 +3426,7 @@ def get_risk_indicators(current_user_id):
         return jsonify([])
     placeholders = ','.join('?' * len(cids))
     cursor.execute("""SELECT category, risk_level, sentiment_score, COUNT(*) FROM company_news 
-        WHERE company_id IN (""" + placeholders + """) AND created_at > datetime('now','-30 day') GROUP BY category, risk_level""", tuple(cids))
+        WHERE company_id IN (""" + placeholders + """) AND created_at > datetime('now','-""" + str(days) + """ day') GROUP BY category, risk_level""", tuple(cids))
     rows = cursor.fetchall()
     conn.close()
     cat_levels = {}
@@ -3091,6 +3450,349 @@ def get_risk_indicators(current_user_id):
         indicators.append({'id': i+1, 'name': name_map.get(cat, cat), 'level': level, 'change': change, 'color': color})
     # 无近期资讯时不返回占位数据，前端显示「暂无数据」；有数据时返回真实聚合指标
     return jsonify(indicators)
+
+
+# ---------- 预警规则（可配置） ----------
+@app.route('/api/alert-rules', methods=['GET', 'OPTIONS'])
+@token_required
+def list_alert_rules(current_user_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, rule_type, config, enabled, created_at FROM alert_rules WHERE user_id=? ORDER BY id", (current_user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify([{'id': r[0], 'name': r[1], 'rule_type': r[2], 'config': r[3], 'enabled': bool(r[4]), 'created_at': r[5]} for r in rows])
+
+
+@app.route('/api/alert-rules', methods=['POST', 'OPTIONS'])
+@token_required
+def create_alert_rule(current_user_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip() or '未命名规则'
+    rule_type = (data.get('rule_type') or 'risk_upgrade').strip()
+    config = json.dumps(data.get('config') or {}, ensure_ascii=False)
+    enabled = 1 if data.get('enabled', True) else 0
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO alert_rules (user_id, name, rule_type, config, enabled) VALUES (?,?,?,?,?)",
+                   (current_user_id, name, rule_type, config, enabled))
+    rid = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({'id': rid, 'message': '规则已添加'}), 201
+
+
+@app.route('/api/alert-rules/<int:rule_id>', methods=['PUT', 'PATCH', 'OPTIONS'])
+@token_required
+def update_alert_rule(current_user_id, rule_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM alert_rules WHERE id=? AND user_id=?", (rule_id, current_user_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '规则不存在或无权限'}), 404
+    updates = []
+    params = []
+    if 'name' in data:
+        updates.append('name=?')
+        params.append((data.get('name') or '').strip() or '未命名规则')
+    if 'rule_type' in data:
+        updates.append('rule_type=?')
+        params.append((data.get('rule_type') or 'risk_upgrade').strip())
+    if 'config' in data:
+        updates.append('config=?')
+        params.append(json.dumps(data.get('config') or {}, ensure_ascii=False))
+    if 'enabled' in data:
+        updates.append('enabled=?')
+        params.append(1 if data.get('enabled') else 0)
+    if updates:
+        params.append(rule_id)
+        cursor.execute("UPDATE alert_rules SET " + ', '.join(updates) + " WHERE id=?", params)
+        conn.commit()
+    conn.close()
+    return jsonify({'message': '已更新'})
+
+
+@app.route('/api/alert-rules/<int:rule_id>', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_alert_rule(current_user_id, rule_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alert_rules WHERE id=? AND user_id=?", (rule_id, current_user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': '已删除'})
+
+
+# ---------- 站内通知 ----------
+@app.route('/api/notifications', methods=['GET', 'OPTIONS'])
+@token_required
+def get_notifications(current_user_id):
+    """站内通知列表，?limit=50&offset=0&unread_only=1"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    limit = min(100, max(1, int(request.args.get('limit', 50))))
+    offset = max(0, int(request.args.get('offset', 0)))
+    unread_only = request.args.get('unread_only', '').strip().lower() in ('1', 'true', 'yes')
+    conn = _db_conn()
+    cursor = conn.cursor()
+    if unread_only:
+        cursor.execute("""SELECT id, type, title, body, related_type, related_id, read_at, created_at
+            FROM notifications WHERE user_id=? AND read_at IS NULL ORDER BY id DESC LIMIT ? OFFSET ?""",
+                       (current_user_id, limit, offset))
+    else:
+        cursor.execute("""SELECT id, type, title, body, related_type, related_id, read_at, created_at
+            FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?""",
+                       (current_user_id, limit, offset))
+    rows = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL", (current_user_id,))
+    unread_count = cursor.fetchone()[0]
+    conn.close()
+    items = [{'id': r[0], 'type': r[1], 'title': r[2], 'body': r[3], 'related_type': r[4], 'related_id': r[5], 'read_at': r[6], 'created_at': r[7]} for r in rows]
+    return jsonify({'items': items, 'unread_count': unread_count})
+
+
+@app.route('/api/notifications/<int:nid>/read', methods=['PATCH', 'POST', 'OPTIONS'])
+@token_required
+def mark_notification_read(current_user_id, nid):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET read_at=? WHERE id=? AND user_id=?", (datetime.utcnow().isoformat(), nid, current_user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': '已标为已读'})
+
+
+@app.route('/api/notifications/read-all', methods=['PATCH', 'POST', 'OPTIONS'])
+@token_required
+def mark_all_notifications_read(current_user_id):
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL", (datetime.utcnow().isoformat(), current_user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'message': '已全部标为已读'})
+
+
+# ---------- 操作审计日志 ----------
+@app.route('/api/audit-log', methods=['GET', 'OPTIONS'])
+@token_required
+def get_audit_log(current_user_id):
+    """查询审计日志：普通用户仅本人，管理员可查全部。?limit=50&offset=0&user_id=（admin 可选）"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    limit = min(200, max(1, int(request.args.get('limit', 50))))
+    offset = max(0, int(request.args.get('offset', 0)))
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE id=?", (current_user_id,))
+    row = cursor.fetchone()
+    is_admin = row and row[0] == 'admin'
+    filter_user = request.args.get('user_id')
+    if is_admin and filter_user:
+        cursor.execute("""SELECT a.id, a.user_id, u.username, a.action, a.resource_type, a.resource_id, a.detail, a.ip, a.created_at
+            FROM audit_log a LEFT JOIN users u ON u.id = a.user_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT ? OFFSET ?""",
+                       (int(filter_user), limit, offset))
+    elif is_admin:
+        cursor.execute("""SELECT a.id, a.user_id, u.username, a.action, a.resource_type, a.resource_id, a.detail, a.ip, a.created_at
+            FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT ? OFFSET ?""", (limit, offset))
+    else:
+        cursor.execute("""SELECT a.id, a.user_id, u.username, a.action, a.resource_type, a.resource_id, a.detail, a.ip, a.created_at
+            FROM audit_log a LEFT JOIN users u ON u.id = a.user_id WHERE a.user_id=? ORDER BY a.id DESC LIMIT ? OFFSET ?""",
+                       (current_user_id, limit, offset))
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify([{'id': r[0], 'user_id': r[1], 'username': r[2], 'action': r[3], 'resource_type': r[4], 'resource_id': r[5], 'detail': r[6], 'ip': r[7], 'created_at': r[8]} for r in rows])
+
+
+# ---------- 企业批量导入 ----------
+@app.route('/api/companies/batch-import', methods=['POST', 'OPTIONS'])
+@token_required
+def batch_import_companies(current_user_id):
+    """批量添加企业。body: { "companies": [ { "name": "企业名", "industry": "行业" }, ... ] }，最多 100 条"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    items = data.get('companies') or []
+    if not isinstance(items, list) or len(items) > 100:
+        return jsonify({'message': '请提供 companies 数组，最多 100 条'}), 400
+    conn = _db_conn()
+    cursor = conn.cursor()
+    created = []
+    for item in items:
+        name = (item.get('name') or '').strip()
+        if not name:
+            continue
+        industry = (item.get('industry') or '').strip()
+        cursor.execute("INSERT INTO companies (name, industry, crawl_status) VALUES (?, ?, 'pending')", (name, industry))
+        cid = cursor.lastrowid
+        cursor.execute("INSERT OR IGNORE INTO user_company_favorites (user_id, company_id) VALUES (?, ?)", (current_user_id, cid))
+        created.append({'id': cid, 'name': name, 'industry': industry})
+    conn.commit()
+    conn.close()
+    _audit_log(current_user_id, 'batch_import', 'company', None, f'导入{len(created)}家')
+    return jsonify({'message': f'已导入 {len(created)} 家企业', 'created': created}), 201
+
+
+# ---------- 备份与恢复 ----------
+@app.route('/api/backup', methods=['POST', 'OPTIONS'])
+@token_required
+@admin_required
+def create_backup(current_user_id):
+    """立即创建数据库备份（仅管理员）"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    backup_dir = os.path.join(os.path.dirname(_DB_PATH), 'backup')
+    os.makedirs(backup_dir, exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    dest = os.path.join(backup_dir, f'risk_platform_{ts}.db')
+    try:
+        import shutil
+        shutil.copy2(_DB_PATH, dest)
+        _audit_log(current_user_id, 'backup', 'system', None, dest)
+        return jsonify({'message': '备份已创建', 'path': dest, 'filename': os.path.basename(dest)})
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+
+@app.route('/api/backup/list', methods=['GET', 'OPTIONS'])
+@token_required
+@admin_required
+def list_backups(current_user_id):
+    """列出备份文件（仅管理员）"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    backup_dir = os.path.join(os.path.dirname(_DB_PATH), 'backup')
+    if not os.path.isdir(backup_dir):
+        return jsonify([])
+    files = []
+    for f in os.listdir(backup_dir):
+        if f.endswith('.db'):
+            path = os.path.join(backup_dir, f)
+            try:
+                mtime = os.path.getmtime(path)
+                files.append({'filename': f, 'path': path, 'modified': datetime.fromtimestamp(mtime).isoformat()})
+            except OSError:
+                pass
+    files.sort(key=lambda x: x['modified'], reverse=True)
+    return jsonify(files[:50])
+
+
+@app.route('/api/backup/restore', methods=['POST', 'OPTIONS'])
+@token_required
+@admin_required
+def restore_backup(current_user_id):
+    """从备份恢复（仅管理员）。body: { "filename": "risk_platform_xxx.db" }"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    filename = (data.get('filename') or '').strip()
+    if not filename or '..' in filename or '/' in filename:
+        return jsonify({'message': '无效的 filename'}), 400
+    backup_dir = os.path.join(os.path.dirname(_DB_PATH), 'backup')
+    path = os.path.join(backup_dir, filename)
+    if not os.path.isfile(path):
+        return jsonify({'message': '备份文件不存在'}), 404
+    try:
+        import shutil
+        shutil.copy2(path, _DB_PATH)
+        _audit_log(current_user_id, 'restore_backup', 'system', None, filename)
+        return jsonify({'message': '已恢复，请重启后端使数据生效'})
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+
+# ---------- 任务执行记录（细化） ----------
+@app.route('/api/task-status/detailed', methods=['GET', 'OPTIONS'])
+@token_required
+def get_task_runs_detailed(current_user_id):
+    """最近任务执行记录：新闻搜索、爬取等。仅返回当前用户有权限的企业相关任务。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    limit = min(100, max(1, int(request.args.get('limit', 30))))
+    conn = _db_conn()
+    cursor = conn.cursor()
+    cids = _user_company_ids(cursor, current_user_id)
+    if not cids:
+        conn.close()
+        return jsonify([])
+    placeholders = ','.join('?' * len(cids))
+    cursor.execute("""
+        SELECT t.id, t.task_type, t.company_id, t.status, t.message, t.started_at, t.finished_at, c.name
+        FROM task_runs t
+        LEFT JOIN companies c ON c.id = t.company_id
+        WHERE t.company_id IN (""" + placeholders + """)
+        ORDER BY t.id DESC
+        LIMIT ?
+    """, tuple(cids) + (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return jsonify([{'id': r[0], 'task_type': r[1], 'company_id': r[2], 'status': r[3], 'message': r[4], 'started_at': r[5], 'finished_at': r[6], 'company_name': r[7]} for r in rows])
+
+
+# ---------- API 文档（OpenAPI） ----------
+@app.route('/api/openapi.yaml', methods=['GET'])
+def serve_openapi():
+    """提供 OpenAPI 3.0 规范文件"""
+    import os as _os
+    p = _os.path.join(_os.path.dirname(__file__), 'openapi.yaml')
+    if not _os.path.isfile(p):
+        return jsonify({'message': 'openapi.yaml not found'}), 404
+    from flask import send_file
+    return send_file(p, mimetype='application/x-yaml', as_attachment=False)
+
+
+@app.route('/api/docs', methods=['GET'])
+def api_docs_ui():
+    """Swagger UI 页面（通过 CDN 加载 openapi.yaml）"""
+    from flask import Response
+    base = request.host_url.rstrip('/')
+    html = f'''<!DOCTYPE html>
+<html><head><meta charset="utf-8"/><title>API 文档</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/></head>
+<body><div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+  SwaggerUIBundle({{ url: "{base}/api/openapi.yaml", dom_id: "#swagger-ui" }});
+</script></body></html>'''
+    return Response(html, mimetype='text/html')
+
+
+# ---------- 健康检查（含依赖状态） ----------
+@app.route('/api/health/detailed', methods=['GET'])
+def health_detailed():
+    """健康检查：db、可选 LLM 配置、MediaCrawler 路径"""
+    out = {'status': 'ok', 'db': 'ok', 'llm_configured': False, 'mediacrawler_path': bool(os.environ.get('MEDIACRAWLER_PATH'))}
+    try:
+        c = _db_conn()
+        c.cursor().execute('SELECT 1').fetchone()
+        c.close()
+    except Exception as e:
+        out['status'] = 'degraded'
+        out['db'] = str(e)[:200]
+    try:
+        conn = _db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM llm_config WHERE api_key IS NOT NULL AND api_key != '' LIMIT 1")
+        out['llm_configured'] = cur.fetchone() is not None
+        conn.close()
+    except Exception:
+        pass
+    return jsonify(out)
+
 
 # Admin routes (require admin role)
 @app.route('/api/admin/users', methods=['GET', 'OPTIONS'])

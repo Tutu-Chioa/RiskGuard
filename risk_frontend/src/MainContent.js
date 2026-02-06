@@ -91,6 +91,10 @@ const MainContent = ({ user }) => {
   const [riskIndicators, setRiskIndicators] = useState([]);
   const [riskCardMenu, setRiskCardMenu] = useState(null);
   const [alerts, setAlerts] = useState([]);
+  const [dashboardDays, setDashboardDays] = useState(7);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState('');
+  const [markingAlertId, setMarkingAlertId] = useState(null);
 
   // 根据当前路径设置选中的标签
   useEffect(() => {
@@ -110,19 +114,23 @@ const MainContent = ({ user }) => {
     }
   }, [location]);
 
-  const loadData = React.useCallback(async () => {
+  const loadData = React.useCallback(async (signal) => {
     const token = localStorage.getItem('token');
     if (!token) return;
+    setDashboardLoading(true);
+    const opts = (url) => ({ headers: { 'Authorization': `Bearer ${token}` }, signal: signal || undefined });
     try {
+      const days = dashboardDays;
       const [dRes, cRes, tRes, rRes, riskDistRes, catDistRes, alertsRes] = await Promise.all([
-        fetch('/api/dashboard', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/companies', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/dashboard/trend', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/risk-indicators', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/dashboard/risk-distribution', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/dashboard/category-distribution', { headers: { 'Authorization': `Bearer ${token}` } }),
-        fetch('/api/alerts', { headers: { 'Authorization': `Bearer ${token}` } })
+        fetch('/api/dashboard', opts()),
+        fetch('/api/companies', opts()),
+        fetch(`/api/dashboard/trend?days=${days}`, opts()),
+        fetch(`/api/risk-indicators?days=${days}`, opts()),
+        fetch('/api/dashboard/risk-distribution', opts()),
+        fetch(`/api/dashboard/category-distribution?days=${days}`, opts()),
+        fetch('/api/alerts' + (alertSeverityFilter ? '?severity=' + encodeURIComponent(alertSeverityFilter) : ''), opts())
       ]);
+      if (signal?.aborted) return;
       if (dRes.ok) setDashboard(await dRes.json());
       if (cRes.ok) {
         const data = await cRes.json();
@@ -135,14 +143,17 @@ const MainContent = ({ user }) => {
       if (catDistRes.ok) { const c = await catDistRes.json(); setCategoryDistribution(Array.isArray(c) ? c : []); }
       if (alertsRes.ok) { const a = await alertsRes.json(); setAlerts(Array.isArray(a) ? a : []); }
     } catch (e) {
-      console.error(e);
+      if (e?.name !== 'AbortError') console.error(e);
+    } finally {
+      if (!signal?.aborted) setDashboardLoading(false);
     }
-  }, []);
+  }, [dashboardDays, alertSeverityFilter]);
 
   useEffect(() => {
-    loadData();
-    const t = setInterval(loadData, 60000);
-    return () => clearInterval(t);
+    const ac = new AbortController();
+    loadData(ac.signal);
+    const t = setInterval(() => loadData(null), 60000);
+    return () => { ac.abort(); clearInterval(t); };
   }, [loadData]);
 
   useEffect(() => {
@@ -252,8 +263,39 @@ const MainContent = ({ user }) => {
     <div className="flex flex-col" style={{ gap: 'var(--density-spacing, 1rem)' }}>
       {selectedTab === 'dashboard' && (
         <>
+          {/* 时间范围选择器 */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm text-gray-600 dark:text-gray-400">统计范围：</span>
+            {[7, 30, 90].map((d) => (
+              <button
+                key={d}
+                type="button"
+                onClick={() => setDashboardDays(d)}
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  dashboardDays === d
+                    ? 'bg-[var(--primary-color)] text-white'
+                    : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'
+                }`}
+              >
+                {d} 天
+              </button>
+            ))}
+          </div>
+
           {/* 顶部横幅：使用主题渐变 */}
           <div className="theme-gradient-banner rounded-2xl p-8 text-white">
+            {dashboardLoading ? (
+              <div className="animate-pulse space-y-4">
+                <div className="h-8 bg-white/20 rounded w-48" />
+                <div className="h-4 bg-white/20 rounded w-64" />
+                <div className="flex gap-4">
+                  <div className="h-5 bg-white/20 rounded w-32" />
+                  <div className="h-5 bg-white/20 rounded w-32" />
+                </div>
+                <div className="mt-6 h-28 bg-white/10 rounded-xl" />
+              </div>
+            ) : (
+            <>
             <div className="flex flex-col md:flex-row justify-between items-start md:items-center">
               <div>
                 <h1 className="text-3xl font-bold mb-2">企业风险总览</h1>
@@ -287,9 +329,9 @@ const MainContent = ({ user }) => {
               </div>
             </div>
             
-            {/* 近7天资讯趋势：柱状图（数值+随值变色）+ 折线图（趋势），横轴日期 */}
+            {/* 近 N 天资讯趋势 */}
             <div className="mt-6 bg-white/10 backdrop-blur rounded-xl p-4">
-              <div className="text-sm font-medium theme-text-banner-muted mb-3">近7天资讯趋势</div>
+              <div className="text-sm font-medium theme-text-banner-muted mb-3">近{dashboardDays}天资讯趋势</div>
               <div className="h-28">
                 <BannerTrendChart
                   data={trend.length > 0 ? trend : [
@@ -299,12 +341,23 @@ const MainContent = ({ user }) => {
                 />
               </div>
             </div>
+            </>
+            )}
           </div>
 
           {/* 风险分布 & 资讯分类分布（真实数据图表） */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700">
               <h3 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-1">企业风险分布</h3>
+              {dashboardLoading ? (
+                <div className="animate-pulse py-8 space-y-4">
+                  <div className="h-48 bg-gray-200 dark:bg-gray-700 rounded" />
+                  <div className="space-y-2">
+                    {[1,2,3,4].map(i => <div key={i} className="h-5 bg-gray-200 dark:bg-gray-700 rounded w-full" />)}
+                  </div>
+                </div>
+              ) : (
+              <>
               <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">统计自 {riskDistTotal} 家企业</p>
               {riskDistTotal > 0 ? (
                 <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -348,9 +401,20 @@ const MainContent = ({ user }) => {
               ) : (
                 <p className="text-gray-500 dark:text-gray-400 py-8 text-center">暂无企业数据，请先添加企业</p>
               )}
+              </>
+              )}
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700">
               <h3 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-1">资讯分类分布</h3>
+              {dashboardLoading ? (
+                <div className="animate-pulse py-8 space-y-4">
+                  <div className="h-48 bg-gray-200 dark:bg-gray-700 rounded" />
+                  <div className="space-y-2">
+                    {[1,2,3,4,5].map(i => <div key={i} className="h-5 bg-gray-200 dark:bg-gray-700 rounded w-full" />)}
+                  </div>
+                </div>
+              ) : (
+              <>
               <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">统计自企业相关新闻（company_news）</p>
               {categoryDistTotal > 0 ? (
                 <div className="flex flex-col md:flex-row gap-4 items-center">
@@ -394,15 +458,27 @@ const MainContent = ({ user }) => {
               ) : (
                 <p className="text-gray-500 dark:text-gray-400 py-8 text-center">暂无资讯分类数据，请先为企业执行「大模型搜索相关新闻」</p>
               )}
+              </>
+              )}
             </div>
           </div>
 
-          {/* 风险指标总览（基于近30天企业相关新闻分类与风险等级聚合） */}
+          {/* 风险指标总览（基于近 N 天企业相关新闻分类与风险等级聚合） */}
           <div>
             <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 mb-1">风险指标总览</h2>
-            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">由企业相关新闻的分类与风险等级自动量化</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">由企业相关新闻的分类与风险等级自动量化（近{dashboardDays}天）</p>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              {riskCards.length === 0 ? (
+              {dashboardLoading ? (
+                <>
+                  {[1,2,3,4].map(i => (
+                    <div key={i} className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700 animate-pulse">
+                      <div className="h-6 bg-gray-200 dark:bg-gray-700 rounded w-3/4 mb-4" />
+                      <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/2 mb-2" />
+                      <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded w-full" />
+                    </div>
+                  ))}
+                </>
+              ) : riskCards.length === 0 ? (
                 <div className="col-span-full md:col-span-2 lg:col-span-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl p-8 border border-gray-100 dark:border-gray-700 text-center">
                   <p className="text-gray-500 dark:text-gray-400">暂无风险指标数据</p>
                   <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">请先添加企业并完成「大模型搜索相关新闻」，系统将根据新闻分类与风险等级自动生成指标</p>
@@ -645,9 +721,24 @@ const MainContent = ({ user }) => {
 
       {selectedTab === 'alerts' && (
         <div>
-          <div className="mb-8">
-            <h1 className="text-3xl font-bold text-gray-800 dark:text-gray-100">风险警报</h1>
-            <p className="text-gray-600 dark:text-gray-400 mt-2">实时接收企业风险警报，快速响应威胁</p>
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h1 className="text-3xl font-bold text-gray-800 dark:text-gray-100">风险警报</h1>
+              <p className="text-gray-600 dark:text-gray-400 mt-2">实时接收企业风险警报，快速响应威胁</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-gray-600 dark:text-gray-400">按严重程度：</span>
+              {['', '高', '中', '低'].map((sev) => (
+                <button
+                  key={sev || 'all'}
+                  type="button"
+                  onClick={() => setAlertSeverityFilter(sev)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium ${alertSeverityFilter === sev ? 'bg-[var(--primary-color)] text-white' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300'}`}
+                >
+                  {sev || '全部'}
+                </button>
+              ))}
+            </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {alerts.length === 0 ? (
@@ -663,6 +754,7 @@ const MainContent = ({ user }) => {
                 const iconColor = isHigh ? 'text-red-600 dark:text-red-400' : isMid ? 'text-yellow-600 dark:text-yellow-400' : 'text-blue-600 dark:text-blue-400';
                 const title = isHigh ? '高风险警报' : isMid ? '中风险警报' : '信息提示';
                 const timeStr = alert.timestamp ? (() => { const d = new Date(alert.timestamp); const n = Date.now() - d.getTime(); if (n < 3600000) return `${Math.floor(n/60000)}${t('alerts.relativeTime')}`; if (n < 86400000) return `${Math.floor(n/3600000)}${t('alerts.hoursAgo')}`; return formatDate(d); })() : '—';
+                const processed = !!alert.processed_at;
                 return (
                   <div key={alert.id} className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-sm border border-gray-100 dark:border-gray-700 transition-all duration-200 hover:shadow-lg hover:scale-[1.02]">
                     <div className="flex items-center mb-4">
@@ -670,15 +762,33 @@ const MainContent = ({ user }) => {
                         <svg className={`w-6 h-6 ${iconColor}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
                       </div>
                       <h3 className="text-lg font-bold text-gray-800 dark:text-gray-100">{title}</h3>
+                      {processed && <span className="ml-2 px-2 py-0.5 text-xs rounded bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300">已处理</span>}
                     </div>
                     <p className="text-gray-600 dark:text-gray-400 mb-4">{alert.description || `${alert.company_name || '企业'} - ${alert.alert_type || alert.severity || '风险'}`}</p>
                     <div className="flex justify-between items-center">
                       <span className="text-sm text-gray-500 dark:text-gray-400">{timeStr}</span>
-                      {alert.company_id && (
-                        <button onClick={() => handleViewCompany(alert.company_id)} className="theme-link text-sm font-medium cursor-pointer">
-                          {isHigh || isMid ? '处理警报' : '查看详情'}
-                        </button>
-                      )}
+                      <div className="flex gap-2">
+                        {!processed && (
+                          <button
+                            disabled={markingAlertId === alert.id}
+                            onClick={async () => {
+                              setMarkingAlertId(alert.id);
+                              const token = localStorage.getItem('token');
+                              const r = await fetch(`/api/alerts/${alert.id}`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}` } });
+                              if (r.ok) loadData(null);
+                              setMarkingAlertId(null);
+                            }}
+                            className="text-sm text-amber-600 dark:text-amber-400 hover:underline disabled:opacity-50"
+                          >
+                            {markingAlertId === alert.id ? '处理中…' : '标记已处理'}
+                          </button>
+                        )}
+                        {alert.company_id && (
+                          <button onClick={() => handleViewCompany(alert.company_id)} className="theme-link text-sm font-medium cursor-pointer">
+                            {processed ? '查看详情' : (isHigh || isMid ? '处理警报' : '查看详情')}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );

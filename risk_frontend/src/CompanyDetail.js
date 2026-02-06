@@ -8,6 +8,8 @@ const CompanyDetail = () => {
   const navigate = useNavigate();
   const toast = useToast();
   const { formatDate, formatDateTime } = useDateTimeFormat();
+  const idRef = useRef(id);
+  idRef.current = id;
   const [company, setCompany] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -27,6 +29,9 @@ const CompanyDetail = () => {
   const [supplementSending, setSupplementSending] = useState(false);
   const [supplementPanelOpen, setSupplementPanelOpen] = useState(true);
   const [listening, setListening] = useState(false);
+  const [askQuestion, setAskQuestion] = useState('');
+  const [askAnswer, setAskAnswer] = useState('');
+  const [askLoading, setAskLoading] = useState(false);
 
   const fetchCompanyNews = useCallback(async () => {
     const currentId = id;
@@ -72,7 +77,11 @@ const CompanyDetail = () => {
   };
 
   const handleClearCompanyNews = async () => {
-    if (!window.confirm('确定清空本企业全部相关新闻？清空后需重新使用「大模型搜索相关新闻」获取。')) return;
+    const confirmWord = window.prompt('确定清空本企业全部相关新闻？请输入「清空」以确认：');
+    if (confirmWord !== '清空') {
+      if (confirmWord !== null) toast.error('输入不匹配，已取消');
+      return;
+    }
     try {
       const token = localStorage.getItem('token');
       const res = await fetch(`/api/companies/${id}/news`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
@@ -100,19 +109,19 @@ const CompanyDetail = () => {
       });
       if (res.ok) {
         const data = await res.json();
-        // 只更新当前仍在该企业详情页时的数据，避免从 A 切到 B 后 A 的请求回来覆盖 B
-        if (String(data?.id) === String(currentId)) {
+        // 仅当响应返回时当前页面仍是该企业时才更新，避免轮询/旧请求覆盖新企业（如添加企业后显示上一家的社会评价条数）
+        if (String(data?.id) === String(idRef.current)) {
           setCompany(data);
         }
         return data;
       } else {
         const err = await res.json();
-        if (String(currentId) === id) setError(err.message || '获取失败');
+        if (String(idRef.current) === String(currentId)) setError(err.message || '获取失败');
       }
     } catch (e) {
-      if (String(currentId) === id) setError('获取企业详情失败: ' + e.message);
+      if (String(idRef.current) === String(currentId)) setError('获取企业详情失败: ' + e.message);
     } finally {
-      if (showLoading && String(currentId) === id) setLoading(false);
+      if (showLoading && String(idRef.current) === String(currentId)) setLoading(false);
     }
   }, [id]);
 
@@ -421,6 +430,23 @@ const CompanyDetail = () => {
             >
               导出 Excel
             </button>
+            <button
+              onClick={async () => {
+                try {
+                  const token = localStorage.getItem('token');
+                  const res = await fetch(`/api/companies/${id}/export-pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
+                  if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.message || '导出失败'); }
+                  const blob = await res.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a'); a.href = url; a.download = `report_${id}.pdf`; a.click();
+                  URL.revokeObjectURL(url);
+                  toast.success('PDF 已下载');
+                } catch (e) { toast.error('导出失败: ' + e.message); }
+              }}
+              className="bg-white theme-link px-6 py-2 rounded-lg hover:bg-gray-100 transition-colors"
+            >
+              导出 PDF
+            </button>
             <button onClick={() => navigate(-1)} className="bg-white/20 text-white px-6 py-2 rounded-lg hover:bg-white/30 transition-colors">
               返回
             </button>
@@ -543,7 +569,11 @@ const CompanyDetail = () => {
               <div className="text-sm text-gray-500">相关新闻条数</div>
             </div>
             <div className="p-3 rounded-lg bg-gray-50 border border-gray-100">
-              <div className="text-2xl font-bold theme-link">{(company?.media_reviews || []).length}</div>
+              <div className="text-2xl font-bold theme-link">
+                {(company?.media_status === 'pending' || company?.media_status === 'running')
+                  ? 0
+                  : (company?.media_reviews || []).length}
+              </div>
               <div className="text-sm text-gray-500">社会评价条数</div>
             </div>
             <div className="p-3 rounded-lg bg-gray-50 border border-gray-100">
@@ -851,6 +881,47 @@ const CompanyDetail = () => {
             </form>
           </>
         )}
+      </div>
+
+      {/* 问这家企业（RAG 式问答） */}
+      <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100">
+        <h2 className="text-xl font-bold text-gray-800 mb-2">问这家企业</h2>
+        <p className="text-sm text-gray-500 mb-4">基于企业基本信息、新闻与尽调补充，AI 将回答与该公司相关的问题</p>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const q = askQuestion.trim();
+            if (!q || askLoading) return;
+            setAskLoading(true);
+            setAskAnswer('');
+            try {
+              const token = localStorage.getItem('token');
+              const res = await fetch(`/api/companies/${id}/ask`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ question: q })
+              });
+              const data = await res.json();
+              if (res.ok) setAskAnswer(data.answer || '');
+              else toast.error(data.message || '回答失败');
+            } catch (err) { toast.error('请求失败: ' + err.message); }
+            setAskLoading(false);
+          }}
+          className="flex gap-2 mb-3"
+        >
+          <input
+            type="text"
+            value={askQuestion}
+            onChange={(e) => setAskQuestion(e.target.value)}
+            placeholder="例如：该公司主要风险点有哪些？"
+            className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            disabled={askLoading}
+          />
+          <button type="submit" disabled={askLoading || !askQuestion.trim()} className="theme-btn-primary px-4 py-2 rounded-lg text-sm disabled:opacity-50">
+            {askLoading ? '回答中…' : '提问'}
+          </button>
+        </form>
+        {askAnswer && <div className="p-4 bg-gray-50 rounded-lg border border-gray-100 text-gray-800 text-sm whitespace-pre-wrap">{askAnswer}</div>}
       </div>
 
       {/* 上传文档 & 添加链接 */}

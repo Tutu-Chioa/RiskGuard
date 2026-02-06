@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from './AuthContext';
+import AuditLogSection from './AuditLogSection';
 
 const AdminPage = () => {
   const { user, role } = useAuth();
@@ -25,6 +26,12 @@ const AdminPage = () => {
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [backupList, setBackupList] = useState([]);
+  const [backupLoading, setBackupLoading] = useState(false);
+  const [backupCreating, setBackupCreating] = useState(false);
+  const [restoreFilename, setRestoreFilename] = useState('');
+  const [restoreConfirm, setRestoreConfirm] = useState('');
+  const [restoreLoading, setRestoreLoading] = useState(false);
 
   const fetchUsers = useCallback(() => {
     const token = localStorage.getItem('token');
@@ -52,6 +59,13 @@ const AdminPage = () => {
           smtp_password: data.smtp_password || '',
         }))
         .finally(() => setSettingsLoading(false));
+    } else if (tab === 'backup') {
+      setBackupLoading(true);
+      const token = localStorage.getItem('token');
+      fetch('/api/backup/list', { headers: { Authorization: `Bearer ${token}` } })
+        .then((r) => (r.ok ? r.json() : []))
+        .then((data) => setBackupList(Array.isArray(data) ? data : []))
+        .finally(() => setBackupLoading(false));
     }
   }, [role, tab, fetchUsers]);
 
@@ -180,6 +194,20 @@ const AdminPage = () => {
           className={`px-4 py-2 text-sm font-medium rounded-t-lg ${tab === 'settings' ? 'bg-[var(--primary-color)]/10 text-[var(--primary-color)] border-b-2 border-[var(--primary-color)]' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'}`}
         >
           系统设置（发件人）
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab('backup')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg ${tab === 'backup' ? 'bg-[var(--primary-color)]/10 text-[var(--primary-color)] border-b-2 border-[var(--primary-color)]' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'}`}
+        >
+          备份恢复
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab('audit')}
+          className={`px-4 py-2 text-sm font-medium rounded-t-lg ${tab === 'audit' ? 'bg-[var(--primary-color)]/10 text-[var(--primary-color)] border-b-2 border-[var(--primary-color)]' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'}`}
+        >
+          审计日志
         </button>
       </div>
 
@@ -416,6 +444,100 @@ const AdminPage = () => {
               </button>
             </form>
           )}
+        </div>
+      )}
+
+      {tab === 'backup' && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 p-6">
+          <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-100 mb-4">备份与恢复</h2>
+          <div className="space-y-4">
+            <div>
+              <button
+                type="button"
+                disabled={backupCreating}
+                onClick={() => {
+                  setBackupCreating(true);
+                  const token = localStorage.getItem('token');
+                  fetch('/api/backup', { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
+                    .then((r) => r.json())
+                    .then((d) => { setMessage(d.message || '备份已创建'); if (d.filename) setBackupList((prev) => [{ filename: d.filename, modified: new Date().toISOString() }, ...prev]); })
+                    .catch(() => setError('创建备份失败'))
+                    .finally(() => setBackupCreating(false));
+                }}
+                className="theme-btn-primary px-4 py-2 rounded-lg disabled:opacity-50"
+              >
+                {backupCreating ? '创建中…' : '立即备份'}
+              </button>
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">备份列表</h3>
+              {backupLoading ? (
+                <p className="text-gray-500">加载中...</p>
+              ) : backupList.length === 0 ? (
+                <p className="text-gray-500">暂无备份文件</p>
+              ) : (
+                <ul className="divide-y divide-gray-200 dark:divide-gray-600">
+                  {backupList.map((item) => {
+                    const f = typeof item === 'string' ? item : (item.filename || item);
+                    return (
+                      <li key={f} className="py-2 flex items-center justify-between gap-2">
+                        <span className="text-gray-800 dark:text-gray-200 font-mono text-sm">{f}</span>
+                        <button
+                          type="button"
+                          onClick={() => { setRestoreFilename(f); setRestoreConfirm(''); }}
+                          className="text-sm text-amber-600 dark:text-amber-400 hover:underline"
+                        >
+                          恢复
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+            {restoreFilename && (
+              <div className="p-4 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800">
+                <p className="text-sm text-amber-800 dark:text-amber-200 mb-2">恢复备份将覆盖当前数据库。请输入「恢复」以确认恢复：<strong>{restoreFilename}</strong></p>
+                <input
+                  type="text"
+                  value={restoreConfirm}
+                  onChange={(e) => setRestoreConfirm(e.target.value)}
+                  placeholder="输入「恢复」"
+                  className="w-full max-w-xs px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 mb-2"
+                />
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    disabled={restoreConfirm !== '恢复' || restoreLoading}
+                    onClick={() => {
+                      setRestoreLoading(true);
+                      setError('');
+                      const token = localStorage.getItem('token');
+                      fetch('/api/backup/restore', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        body: JSON.stringify({ filename: restoreFilename })
+                      })
+                        .then((r) => r.json())
+                        .then((d) => { setMessage(d.message || '恢复成功，请刷新页面'); setRestoreFilename(''); setRestoreConfirm(''); })
+                        .catch(() => setError('恢复失败'))
+                        .finally(() => setRestoreLoading(false));
+                    }}
+                    className="px-4 py-2 bg-amber-600 text-white rounded-lg disabled:opacity-50 hover:bg-amber-700"
+                  >
+                    {restoreLoading ? '恢复中…' : '确认恢复'}
+                  </button>
+                  <button type="button" onClick={() => { setRestoreFilename(''); setRestoreConfirm(''); }} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300">取消</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === 'audit' && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-100 dark:border-gray-700 p-6">
+          <AuditLogSection isAdmin={true} />
         </div>
       )}
     </div>

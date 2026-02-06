@@ -10,7 +10,7 @@ def save_media_reviews_dedup(db_path, company_id, company_name, reviews, api_key
     媒体舆情入库，按 (company_id, platform, title) 去重，只插入新条目。
     然后根据本次爬取内容更新企业社会评价、风险等级与关键词。
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     cu = conn.cursor()
     for r in reviews:
         title = (r.get('title') or '')[:200]

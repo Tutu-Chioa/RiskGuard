@@ -290,13 +290,6 @@ const LoginPage = ({ onLogin }) => {
             {isLogin ? '还没有账户？立即注册' : '已有账户？立即登录'}
           </button>
         </div>
-
-        {/* 提示信息 */}
-        <div className="mt-6 sm:mt-8 p-3 sm:p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
-          <p className="text-sm text-blue-700 dark:text-blue-300">
-            <strong>提示：</strong> 管理员账户: admin / admin123
-          </p>
-        </div>
       </div>
     </div>
   );

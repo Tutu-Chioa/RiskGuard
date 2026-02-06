@@ -15,6 +15,8 @@ const TaskStatus = () => {
   const { formatDateTime } = useDateTimeFormat();
   const [companies, setCompanies] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [taskRuns, setTaskRuns] = useState([]);
+  const [runsLoading, setRunsLoading] = useState(true);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -28,10 +30,62 @@ const TaskStatus = () => {
       .finally(() => setLoading(false));
   }, [navigate]);
 
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+    setRunsLoading(true);
+    fetch('/api/task-status/detailed?limit=30', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : [])
+      .then(data => setTaskRuns(Array.isArray(data) ? data : []))
+      .finally(() => setRunsLoading(false));
+  }, []);
+
   return (
     <div className="p-6 max-w-5xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100 mb-2">任务状态</h1>
       <p className="text-sm text-gray-500 dark:text-gray-400 mb-6">查看各企业工商信息、相关新闻与社会评价任务的执行状态及最近更新时间</p>
+
+      {/* 最近任务执行记录 */}
+      <div className="rounded-xl border border-gray-200 dark:border-gray-600 overflow-hidden bg-white dark:bg-gray-800 mb-8">
+        <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-100 px-4 py-3 border-b border-gray-200 dark:border-gray-600">最近任务执行记录</h2>
+        {runsLoading ? (
+          <div className="p-6 text-center text-gray-500">加载中…</div>
+        ) : taskRuns.length === 0 ? (
+          <div className="p-6 text-center text-gray-500 dark:text-gray-400">暂无执行记录（进行过「大模型搜索相关新闻」等操作后会在此显示）</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50">
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">类型</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">企业</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">状态</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">说明</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">开始</th>
+                  <th className="text-left py-2 px-3 font-medium text-gray-700 dark:text-gray-300">结束</th>
+                </tr>
+              </thead>
+              <tbody>
+                {taskRuns.map((run) => {
+                  const st = statusLabel(run.status);
+                  return (
+                    <tr key={run.id} className="border-b border-gray-100 dark:border-gray-700">
+                      <td className="py-2 px-3 text-gray-700 dark:text-gray-300">{run.task_type === 'news_search' ? '新闻搜索' : run.task_type || '-'}</td>
+                      <td className="py-2 px-3">
+                        {run.company_id ? <Link to={`/company/${run.company_id}`} className="theme-link">{run.company_name || run.company_id}</Link> : '-'}
+                      </td>
+                      <td className={`py-2 px-3 ${st.color}`}>{st.text}</td>
+                      <td className="py-2 px-3 text-gray-600 dark:text-gray-400 max-w-xs truncate">{run.message || '-'}</td>
+                      <td className="py-2 px-3 text-gray-500">{run.started_at ? formatDateTime(run.started_at) : '-'}</td>
+                      <td className="py-2 px-3 text-gray-500">{run.finished_at ? formatDateTime(run.finished_at) : '-'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
 
       {loading ? (
         <div className="flex justify-center py-12">

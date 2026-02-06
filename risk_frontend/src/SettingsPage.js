@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from './AuthContext';
 import { useSettings } from './SettingsContext';
 import { THEME_PRESETS } from './themePresets';
+import AlertRulesSection from './AlertRulesSection';
+import AuditLogSection from './AuditLogSection';
 
 const SettingsPage = () => {
   const { user } = useAuth();
@@ -69,6 +71,7 @@ const SettingsPage = () => {
   const [twoFactorSetupLoading, setTwoFactorSetupLoading] = useState(false);
   const [twoFactorDisableOpen, setTwoFactorDisableOpen] = useState(false);
   const [twoFactorDisableCode, setTwoFactorDisableCode] = useState('');
+  const [twoFactorDisableConfirm, setTwoFactorDisableConfirm] = useState('');
   const [twoFactorDisableLoading, setTwoFactorDisableLoading] = useState(false);
   const [lastBackupTime, setLastBackupTime] = useState(null);
 
@@ -424,6 +427,7 @@ const SettingsPage = () => {
   const confirm2FADisable = (e) => {
     e.preventDefault();
     if (!twoFactorDisableCode || twoFactorDisableCode.length !== 6) { setMessage('请输入 6 位验证码'); return; }
+    if (twoFactorDisableConfirm !== '关闭') { setMessage('请输入「关闭」以确认'); return; }
     setTwoFactorDisableLoading(true);
     const token = localStorage.getItem('token');
     fetch('/api/auth/2fa/disable', {
@@ -437,6 +441,7 @@ const SettingsPage = () => {
           setMessage('两步验证已关闭');
           setTwoFactorDisableOpen(false);
           setTwoFactorDisableCode('');
+          setTwoFactorDisableConfirm('');
           refetchSecuritySettings();
         } else setMessage(data.message || '验证失败');
       })
@@ -699,6 +704,36 @@ const SettingsPage = () => {
                   安全设置
                 </button>
               </li>
+              <li>
+                <button
+                  onClick={() => setActiveTab('alert-rules')}
+                  className={`w-full text-left px-4 py-2 rounded-lg flex items-center ${
+                    activeTab === 'alert-rules'
+                      ? 'theme-bg-light theme-link font-medium'
+                      : 'text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+                  </svg>
+                  预警规则
+                </button>
+              </li>
+              <li>
+                <button
+                  onClick={() => setActiveTab('audit-log')}
+                  className={`w-full text-left px-4 py-2 rounded-lg flex items-center ${
+                    activeTab === 'audit-log'
+                      ? 'theme-bg-light theme-link font-medium'
+                      : 'text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2v10" />
+                  </svg>
+                  操作日志
+                </button>
+              </li>
             </ul>
             
             <div className="mt-8 pt-6 border-t border-gray-200">
@@ -720,6 +755,17 @@ const SettingsPage = () => {
                 </svg>
                 导出设置
               </button>
+              <a
+                href="/api/docs"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full text-left px-4 py-2 text-gray-600 hover:bg-gray-50 rounded-lg flex items-center mt-2"
+              >
+                <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                API 文档（OpenAPI）
+              </a>
             </div>
           </div>
         </div>
@@ -1452,7 +1498,7 @@ const SettingsPage = () => {
                         <span className="text-sm text-green-600 dark:text-green-400 font-medium">已启用</span>
                         <button
                           type="button"
-                          onClick={() => { setTwoFactorDisableCode(''); setTwoFactorDisableOpen(true); }}
+                          onClick={() => { setTwoFactorDisableCode(''); setTwoFactorDisableConfirm(''); setTwoFactorDisableOpen(true); }}
                           className="px-4 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
                         >
                           关闭两步验证
@@ -1550,7 +1596,7 @@ const SettingsPage = () => {
                   <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" onClick={() => !twoFactorDisableLoading && setTwoFactorDisableOpen(false)}>
                     <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-xl max-w-sm w-full p-6" onClick={e => e.stopPropagation()}>
                       <h3 className="text-lg font-semibold text-gray-800 dark:text-gray-100 mb-4">关闭两步验证</h3>
-                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">请输入当前 6 位验证码以关闭两步验证。</p>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">请输入当前 6 位验证码，并输入「关闭」以确认。</p>
                       <form onSubmit={confirm2FADisable} className="space-y-3">
                         <input
                           type="text"
@@ -1561,8 +1607,15 @@ const SettingsPage = () => {
                           placeholder="输入 6 位验证码"
                           className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                         />
+                        <input
+                          type="text"
+                          value={twoFactorDisableConfirm}
+                          onChange={e => setTwoFactorDisableConfirm(e.target.value)}
+                          placeholder="输入「关闭」以确认"
+                          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                        />
                         <div className="flex gap-2">
-                          <button type="submit" disabled={twoFactorDisableLoading || twoFactorDisableCode.length !== 6} className="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
+                          <button type="submit" disabled={twoFactorDisableLoading || twoFactorDisableCode.length !== 6 || twoFactorDisableConfirm !== '关闭'} className="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">
                             {twoFactorDisableLoading ? '处理中...' : '确认关闭'}
                           </button>
                           <button type="button" onClick={() => setTwoFactorDisableOpen(false)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300">
@@ -1609,6 +1662,20 @@ const SettingsPage = () => {
                   </button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {activeTab === 'alert-rules' && (
+            <div className="bg-white dark:bg-gray-800 rounded-2xl p-4 sm:p-6 shadow-sm border border-gray-100 dark:border-gray-700">
+              <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 mb-6">预警规则</h2>
+              <AlertRulesSection />
+            </div>
+          )}
+
+          {activeTab === 'audit-log' && (
+            <div className="bg-white dark:bg-gray-800 rounded-2xl p-4 sm:p-6 shadow-sm border border-gray-100 dark:border-gray-700">
+              <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 mb-6">操作日志</h2>
+              <AuditLogSection isAdmin={false} />
             </div>
           )}
         </div>

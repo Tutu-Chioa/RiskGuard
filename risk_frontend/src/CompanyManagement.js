@@ -17,6 +17,9 @@ const CompanyManagement = () => {
   const [editingCompany, setEditingCompany] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
+  const [showBatchImportModal, setShowBatchImportModal] = useState(false);
+  const [batchImportText, setBatchImportText] = useState('');
+  const [batchImportLoading, setBatchImportLoading] = useState(false);
   const [newCompany, setNewCompany] = useState({
     name: '',
     industry: '',
@@ -155,9 +158,77 @@ const CompanyManagement = () => {
     }
   };
 
-  // 删除企业
+  // 批量导入：解析文本或文件为 { name, industry? }[]，最多 100 条
+  const parseBatchInput = (text) => {
+    const lines = text.trim().split(/\n/).map(l => l.trim()).filter(Boolean);
+    const companies = [];
+    for (const line of lines) {
+      const parts = line.split(/[,，\t]/).map(p => p.trim()).filter(Boolean);
+      companies.push({ name: parts[0] || line, industry: parts[1] || '' });
+    }
+    return companies.slice(0, 100);
+  };
+
+  const handleBatchImport = async (e) => {
+    e.preventDefault();
+    const list = parseBatchInput(batchImportText);
+    if (list.length === 0) {
+      toast.error('请至少输入一行企业名称（每行一个，或 名称,行业）');
+      return;
+    }
+    if (list.length > 100) {
+      toast.error('最多支持 100 条，已截断');
+    }
+    setBatchImportLoading(true);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/companies/batch-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ companies: list })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast.success(data.message || `成功导入 ${list.length} 家企业`);
+        setBatchImportText('');
+        setShowBatchImportModal(false);
+        fetchCompanies();
+      } else {
+        toast.error(data.message || '批量导入失败');
+      }
+    } catch (err) {
+      toast.error('网络错误: ' + (err.message || ''));
+    } finally {
+      setBatchImportLoading(false);
+    }
+  };
+
+  const handleBatchImportFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      let text = reader.result;
+      if (file.name.endsWith('.json')) {
+        try {
+          const json = JSON.parse(text);
+          const arr = Array.isArray(json) ? json : (json.companies || []);
+          const list = arr.slice(0, 100).map(c => ({ name: c.name || String(c), industry: c.industry || '' }));
+          setBatchImportText(list.map(c => c.industry ? `${c.name}, ${c.industry}` : c.name).join('\n'));
+        } catch (_) {
+          toast.error('JSON 格式无效');
+          return;
+        }
+      } else {
+        setBatchImportText(text);
+      }
+    };
+    reader.readAsText(file, 'UTF-8');
+  };
+
+  // 删除企业（二次确认：需输入「删除」）
   const handleDeleteCompany = async (id, name) => {
-    if (!window.confirm(`确定要删除企业 "${name}" 吗？`)) {
+    const confirmWord = window.prompt(`为确认删除，请输入「删除」以删除企业 "${name}"：`);
+    if (confirmWord !== '删除') {
+      if (confirmWord !== null) toast.error('输入不匹配，已取消');
       return;
     }
 
@@ -172,7 +243,7 @@ const CompanyManagement = () => {
 
       if (response.ok) {
         setCompanies(prev => prev.filter(c => c.id !== id));
-        alert('企业删除成功！');
+        toast.success('企业删除成功');
       } else {
         const errorData = await response.json();
         toast.error(`删除失败: ${errorData.message || '未知错误'}`);
@@ -192,14 +263,24 @@ const CompanyManagement = () => {
             <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">企业监控管理</h1>
             <p className="mt-2 text-gray-600 dark:text-gray-400">管理您的企业监控列表</p>
           </div>
-          <button
-            type="button"
-            onClick={() => setShowAddModal(true)}
-            className="inline-flex items-center px-4 py-2 theme-btn-primary rounded-lg font-medium shadow-sm"
-          >
-            <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
-            添加企业
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowBatchImportModal(true)}
+              className="inline-flex items-center px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg font-medium hover:bg-gray-200 dark:hover:bg-gray-600"
+            >
+              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+              批量导入
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowAddModal(true)}
+              className="inline-flex items-center px-4 py-2 theme-btn-primary rounded-lg font-medium shadow-sm"
+            >
+              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
+              添加企业
+            </button>
+          </div>
         </div>
 
         {/* 筛选与排序 */}
@@ -353,7 +434,9 @@ const CompanyManagement = () => {
                               registered_capital: company.registered_capital || '',
                               business_status: company.business_status || '',
                               registered_address: company.registered_address || '',
-                              business_scope: company.business_scope || ''
+                              business_scope: company.business_scope || '',
+                              tags: company.tags || '',
+                              supplement_notes: company.supplement_notes || ''
                             });
                             setShowEditModal(true);
                           }}
@@ -417,6 +500,34 @@ const CompanyManagement = () => {
         </div>
       )}
 
+      {/* 批量导入弹窗 */}
+      {showBatchImportModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-xl font-semibold text-gray-800 dark:text-gray-100">批量导入企业</h2>
+              <button type="button" onClick={() => { setShowBatchImportModal(false); setBatchImportText(''); }} className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <form onSubmit={handleBatchImport} className="p-6 space-y-4">
+              <p className="text-sm text-gray-600 dark:text-gray-400">每行一个企业，格式：<strong>企业名称</strong> 或 <strong>企业名称, 行业</strong>。也可上传 CSV/JSON 文件（JSON 需含 name 或 companies 数组）。最多 100 条。</p>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">粘贴列表或上传文件</label>
+                <textarea value={batchImportText} onChange={(e) => setBatchImportText(e.target.value)} rows={10} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm" placeholder="北京某某科技有限公司&#10;上海某某网络有限公司, 互联网" />
+                <input type="file" accept=".txt,.csv,.json" className="mt-2 text-sm text-gray-600 dark:text-gray-400" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleBatchImportFile(f); e.target.value = ''; }} />
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="button" onClick={() => { setShowBatchImportModal(false); setBatchImportText(''); }} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">取消</button>
+                <button type="submit" disabled={batchImportLoading} className="flex-1 px-4 py-2 theme-btn-primary rounded-lg disabled:opacity-50">
+                  {batchImportLoading ? '导入中…' : '导入'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* 编辑企业弹窗 */}
       {showEditModal && editingCompany && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -464,6 +575,16 @@ const CompanyManagement = () => {
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">经营范围</label>
                 <textarea rows={3} value={editingCompany.business_scope} onChange={(e) => setEditingCompany({ ...editingCompany, business_scope: e.target.value })} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">标签</label>
+                  <input type="text" value={editingCompany.tags ?? ''} onChange={(e) => setEditingCompany({ ...editingCompany, tags: e.target.value })} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" placeholder="逗号分隔，如：重点, 供应商" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">补充备注</label>
+                  <input type="text" value={editingCompany.supplement_notes ?? ''} onChange={(e) => setEditingCompany({ ...editingCompany, supplement_notes: e.target.value })} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" placeholder="可选" />
+                </div>
               </div>
               <div className="flex gap-3 pt-2">
                 <button type="button" onClick={() => { setShowEditModal(false); setEditingCompany(null); }} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300">取消</button>

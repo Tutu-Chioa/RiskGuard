@@ -461,3 +461,30 @@ def process_supplement_chat(company_name, company_summary, user_input, api_key=N
     if result and isinstance(result, dict):
         return result
     return {'updates': {}, 'summary': '未能解析，请重试或检查 LLM 配置。'}
+
+
+def ask_company_question(company_name, context_text, question, api_key=None, base_url=None, model=None):
+    """基于企业上下文回答用户问题（RAG-lite：无向量库，直接拼接上下文）。返回 {"answer": "..."}"""
+    if not api_key or not (question or '').strip():
+        return {'answer': '请配置 LLM 并输入问题。'}
+    prompt = f"""你是一个企业风控与尽调助手。请仅根据以下「企业相关信息」回答用户问题。若信息中无法得出答案，请如实说明。
+
+【企业相关信息】
+{context_text[:6000] or '（暂无）'}
+
+【用户问题】
+{(question or '').strip()[:500]}
+
+请用简洁、准确的一段话回答，直接输出答案内容，不要重复问题。"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url or 'https://api.openai.com/v1')
+        resp = client.chat.completions.create(
+            model=model or 'gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.2
+        )
+        text = (resp.choices[0].message.content or '').strip()
+        return {'answer': text or '未得到有效回答。'}
+    except Exception as e:
+        return {'answer': f'回答失败：{str(e)[:200]}'}
