@@ -46,12 +46,11 @@ npm run start:backend    # 后端 8005
 npm run serve            # 构建前端并启动静态+代理 3004
 ```
 
-浏览器访问 **http://localhost:3004**。详细步骤见 [STARTUP.md](STARTUP.md)，上线前清单见 [docs/PRE_LAUNCH_GAP.md](docs/PRE_LAUNCH_GAP.md)。
+浏览器访问 **http://localhost:3004**。详细步骤见 [STARTUP.md](STARTUP.md)。
 
 ## 文档
 
 - [STARTUP.md](STARTUP.md) — 本地/服务器启动流程  
-- [docs/PRE_LAUNCH_GAP.md](docs/PRE_LAUNCH_GAP.md) — 上线前必做项  
 - [docs/WHO_DOES_WHAT.md](docs/WHO_DOES_WHAT.md) — 配置项谁来做  
 - [docs/DEPLOY_FROM_GITHUB.md](docs/DEPLOY_FROM_GITHUB.md) — 从 GitHub 部署到云服务器  
 - [backend/CRAWLER_SETUP.md](backend/CRAWLER_SETUP.md) — 爬虫与 LLM 配置  
