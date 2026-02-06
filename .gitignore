@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.pyc
+venv/
+venv_sys2/
+risk_frontend/build/
+risk_frontend/node_modules/
+logs/
+*.log
+# 数据库、备份、爬虫会话等不要提交到 Git
+data/
+backend/.env
+# 前端本地环境（若有敏感内容）
+risk_frontend/.env

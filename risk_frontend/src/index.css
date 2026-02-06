@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary-color: #7c3aed;
+  --theme-primary: #7c3aed;
+  --theme-primary-hover: #6d28d9;
+  --theme-gradient-from: #7c3aed;
+  --theme-gradient-to: #4f46e5;
+  --theme-line-stroke: #8b5cf6;
+  --theme-chart-1: #8b5cf6;
+  --theme-chart-2: #6366f1;
+  --theme-chart-3: #a78bfa;
+  --theme-chart-4: #818cf8;
+  --theme-chart-5: #c4b5fd;
+  --theme-chart-6: #a5b4fc;
+  --theme-chart-7: #ddd6fe;
+  --theme-chart-8: #e9d5ff;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.bg-primary {
+  background-color: var(--theme-primary);
+}
+.hover\:bg-primary:hover {
+  background-color: var(--theme-primary-hover);
+}
+.ring-primary {
+  --tw-ring-color: var(--theme-primary);
+}
+
+/* 多主题：整站统一使用，设置中切换主题后全局生效 */
+.theme-bg-primary { background-color: var(--theme-primary); }
+.theme-bg-primary-hover:hover { background-color: var(--theme-primary-hover); }
+.theme-gradient-banner {
+  background: linear-gradient(to right, var(--theme-gradient-from), var(--theme-gradient-to));
+}
+.theme-text-banner-muted { color: rgba(255,255,255,0.85); }
+.theme-text-banner-sub { color: rgba(255,255,255,0.7); }
+.theme-btn-primary {
+  background-color: var(--theme-primary);
+  color: #fff;
+}
+.theme-btn-primary:hover { background-color: var(--theme-primary-hover); }
+.theme-link { color: var(--theme-primary); }
+.theme-link:hover { color: var(--theme-primary-hover); }
+.theme-ring { --tw-ring-color: var(--theme-primary); }
+.theme-border-selected { border-color: var(--theme-primary); }
+.theme-border-l { border-left-color: var(--theme-primary); }
+.theme-spin { border-top-color: var(--theme-primary); border-bottom-color: var(--theme-primary); }
+.theme-fill-icon { color: var(--theme-primary); }
+.theme-bg-light { background-color: color-mix(in srgb, var(--theme-primary) 15%, transparent); }
+.theme-bg-light-hover:hover { background-color: color-mix(in srgb, var(--theme-primary) 25%, transparent); }
+.theme-chart-1 { --chart-c: var(--theme-chart-1); }
+.theme-chart-2 { --chart-c: var(--theme-chart-2); }
+.theme-chart-3 { --chart-c: var(--theme-chart-3); }
+.theme-chart-4 { --chart-c: var(--theme-chart-4); }
+.theme-chart-5 { --chart-c: var(--theme-chart-5); }
+.theme-chart-6 { --chart-c: var(--theme-chart-6); }
+.theme-chart-7 { --chart-c: var(--theme-chart-7); }
+.theme-chart-8 { --chart-c: var(--theme-chart-8); }
+.theme-line-stroke { stroke: var(--theme-line-stroke); }
+/* 界面密度：紧凑 0.5rem / 标准 1rem / 舒适 1.5rem，用于列表、卡片等间距 */
+.density-padding {
+  padding: var(--density-spacing, 1rem);
+}
+.density-gap {
+  gap: var(--density-spacing, 1rem);
+}
+
+.dark body {
+  background-color: #111827;
+  color: #f9fafb;
+}
+
+/* 图表深色模式：Tooltip、网格、刻度、饼图描边 */
+.dark {
+  --chart-tooltip-bg: rgb(31 41 55);
+  --chart-tooltip-border: rgb(75 85 99);
+  --chart-grid: rgb(75 85 99);
+  --chart-tick: rgb(209 213 219);
+  --chart-pie-stroke: rgb(55 65 81);
+  --chart-label-line: rgb(148 163 184);
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
+}

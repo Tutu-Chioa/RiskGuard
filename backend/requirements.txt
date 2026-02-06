@@ -1,0 +1,15 @@
+Flask
+flask-cors
+python-dotenv>=1.0.0
+Werkzeug
+PyJWT
+pyotp>=2.9.0
+qrcode[pil]>=7.4.0
+openai>=1.0.0
+APScheduler>=3.10.0
+requests>=2.28.0
+wordcloud>=1.9.0
+matplotlib>=3.7.0
+jieba>=0.42.1
+pypdf>=3.0.0
+openpyxl>=3.1.0

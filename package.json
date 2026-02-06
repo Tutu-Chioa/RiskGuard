@@ -1,0 +1,16 @@
+{
+  "scripts": {
+    "start:backend": "python backend/app.py",
+    "start:server": "node server/server.js",
+    "start:frontend": "cd risk_frontend && npm start",
+    "build:frontend": "cd risk_frontend && (rm -rf build node_modules/.cache 2>/dev/null; true) && CI=true npm run build",
+    "serve": "npm run build:frontend && npm run start:server"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "express-http-proxy": "^2.1.2",
+    "http-proxy": "^1.18.1",
+    "http-proxy-middleware": "^3.0.5"
+  }
+}
