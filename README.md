@@ -30,8 +30,8 @@ RiskGuard（企业风险监控系统）支持添加关注企业、爬取工商�
 
 ```bash
 # 克隆
-git clone https://github.com/你的用户名/你的仓库名.git
-cd 你的仓库名
+git clone https://github.com/Tutu-Chioa/RiskGuard.git
+cd RiskGuard
 
 # 后端
 pip install -r backend/requirements.txt
@@ -47,6 +47,15 @@ npm run serve            # 构建前端并启动静态+代理 3004
 ```
 
 浏览器访问 **http://localhost:3004**。详细步骤见 [STARTUP.md](STARTUP.md)。
+
+## 项目介绍页
+
+仓库中的 [intro.html](intro.html) 为产品介绍单页，适合给他人快速了解 RiskGuard。若需在线访问，可启用 **GitHub Pages**：
+
+1. 仓库页 → **Settings** → 左侧 **Pages**
+2. **Source** 选 **Deploy from a branch**
+3. **Branch** 选 `main`，**Folder** 选 **/ (root)**，保存
+4. 几分钟后访问：**https://tutu-chioa.github.io/RiskGuard/intro.html**
 
 ## 文档
 
