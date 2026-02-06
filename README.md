@@ -50,12 +50,10 @@ npm run serve            # 构建前端并启动静态+代理 3004
 
 ## 项目介绍页
 
-仓库中的 [intro.html](intro.html) 为产品介绍单页，适合给他人快速了解 RiskGuard。若需在线访问，可启用 **GitHub Pages**：
+我们提供了一页式产品介绍，方便您快速了解 RiskGuard 的功能与使用场景：
 
-1. 仓库页 → **Settings** → 左侧 **Pages**
-2. **Source** 选 **Deploy from a branch**
-3. **Branch** 选 `main`，**Folder** 选 **/ (root)**，保存
-4. 几分钟后访问：**https://tutu-chioa.github.io/RiskGuard/intro.html**
+- **在线访问**：<https://tutu-chioa.github.io/RiskGuard/intro.html>
+- **本地查看**：克隆仓库后直接打开根目录下的 [intro.html](intro.html)
 
 ## 文档
 
