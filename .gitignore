@@ -1,10 +1,14 @@
+.DS_Store
 node_modules/
 __pycache__/
 *.pyc
 venv/
+.venv/
 venv_sys2/
 risk_frontend/build/
 risk_frontend/node_modules/
+build/
+dist/
 logs/
 *.log
 # 数据库、备份、爬虫会话等不要提交到 Git

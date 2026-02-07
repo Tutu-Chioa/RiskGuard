@@ -29,6 +29,8 @@ def _mc_path():
 
 
 def main():
+    # 在 import playwright 之前强制旧版 headless，避免 macOS 上 --headless=new 崩溃
+    os.environ['PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW'] = '0'
     mc_path = _mc_path()
     if not mc_path:
         print("[run_media_login_with_qr] MEDIACRAWLER_PATH not set or invalid", file=sys.stderr)
@@ -38,8 +40,26 @@ def main():
     if mc_path not in sys.path:
         sys.path.insert(0, mc_path)
 
+    # SQLAlchemy 2.0 移除了 sqlalchemy.ext.declarative，MediaCrawler 仍用旧导入，在此做兼容
+    # 必须设置 __file__ 为有效路径，否则 inspect 会报 "is a built-in module"
+    try:
+        from sqlalchemy.orm import declarative_base as _declarative_base
+        import sqlalchemy.orm
+        import types
+        _decl = types.ModuleType('declarative')
+        _decl.declarative_base = _declarative_base
+        _decl.__file__ = getattr(sqlalchemy.orm, '__file__', __file__)
+        sys.modules['sqlalchemy.ext.declarative'] = _decl
+        import sqlalchemy.ext
+        sqlalchemy.ext.declarative = _decl
+    except Exception:
+        pass
+
     platform = os.environ.get("PLATFORM", "xhs").strip() or "xhs"
     qr_file = os.environ.get("MEDIACRAWLER_QR_FILE", "").strip()
+    print(f"[run_media_login_with_qr] MEDIACRAWLER_QR_FILE={qr_file!r} mc_path={mc_path!r}", file=sys.stderr)
+    if not qr_file:
+        print("[run_media_login_with_qr] 未设置 MEDIACRAWLER_QR_FILE，二维码将无法写入供前端显示", file=sys.stderr)
     sys2_sessions = os.environ.get("SYS2_SESSIONS_DIR", "").strip()
     # 若未传入（子进程 env 异常），用与 backend 一致的路径：脚本在 backend/scripts/ -> 上级两级为 sys2
     if not sys2_sessions:
@@ -47,14 +67,15 @@ def main():
         _sys2_root = os.path.dirname(os.path.dirname(_script_dir))  # backend -> sys2
         sys2_sessions = os.path.join(_sys2_root, "data", "mediacrawler_sessions")
 
-    # 最小化爬取：仅登录后爬 1 条即结束
+    # 最小化爬取：仅登录后爬 1 条即结束；macOS 上用有界面模式避免 Chromium 崩溃
+    _headless = "false" if sys.platform == "darwin" else "true"
     sys.argv = [
         "main.py",
         "--platform", platform,
         "--lt", "qrcode",
         "--type", "search",
         "--keywords", "登录",
-        "--headless", "true",
+        "--headless", _headless,
         "--get_comment", "false",
         "--get_sub_comment", "false",
     ]
@@ -62,7 +83,8 @@ def main():
     # 先改 config，再被 main 的 parse_cmd 覆盖的部分用 argv 控制
     import config
     config.ENABLE_CDP_MODE = False  # 使用 Playwright，便于无头且输出二维码到文件
-    config.HEADLESS = True
+    # macOS 上无头 Chromium 易崩溃（mach_vm_read/Rosetta），改为有界面模式；二维码仍会写入文件供前端显示
+    config.HEADLESS = False if sys.platform == "darwin" else True
     config.CRAWLER_MAX_NOTES_COUNT = 1
     config.ENABLE_GET_MEIDAS = False
     config.ENABLE_GET_COMMENTS = False
@@ -85,6 +107,7 @@ def main():
     from tools import utils
 
     def write_qrcode(qr_code):
+        print(f"[run_media_login_with_qr] write_qrcode called, has_data={bool(qr_code)}, qr_file={qr_file!r}", file=sys.stderr)
         if not qr_code:
             return
         if "," in str(qr_code):
@@ -95,6 +118,7 @@ def main():
                 os.makedirs(os.path.dirname(qr_file), exist_ok=True)
                 with open(qr_file, "w", encoding="utf-8") as f:
                     f.write(data_url)
+                print(f"[run_media_login_with_qr] QR written to {qr_file}", file=sys.stderr)
             except Exception as e:
                 print(f"[run_media_login_with_qr] write qrcode failed: {e}", file=sys.stderr)
 
@@ -120,9 +144,29 @@ def main():
                     f.flush()
             except Exception as e:
                 print(f"[run_media_login_with_qr] write marker failed ({base}): {e}", file=sys.stderr)
+        if qr_file and os.path.isfile(qr_file):
+            try:
+                os.remove(qr_file)
+                print(f"[run_media_login_with_qr] cleared QR file {qr_file!r}", file=sys.stderr)
+            except Exception as e:
+                print(f"[run_media_login_with_qr] clear QR file failed: {e}", file=sys.stderr)
 
-    # 先 import main，让 media_platform.xhs.login 被加载，再 patch 确保改的是爬虫会用到的同一份
-    from main import main as app_main, async_cleanup
+    # 先 import main；bundle 里 main.py 可能是目录（内含 main.py 文件），需用 spec 加载
+    _main_py = os.path.join(mc_path, "main.py")
+    if os.path.isfile(_main_py):
+        from main import main as app_main, async_cleanup
+    else:
+        _main_file = os.path.join(_main_py, "main.py")
+        if os.path.isfile(_main_file):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("main", _main_file)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["main"] = mod
+            spec.loader.exec_module(mod)
+            app_main = mod.main
+            async_cleanup = getattr(mod, "async_cleanup", lambda: asyncio.sleep(0))
+        else:
+            from main import main as app_main, async_cleanup
     from tools.app_runner import run
 
     try:
@@ -140,13 +184,55 @@ def main():
     except Exception as e:
         print(f"[run_media_login_with_qr] patch check_login_state: {e}", file=sys.stderr)
 
+    # 强制旧版 headless：macOS 上 --headless=new 易崩溃（mach_vm_read / libRosetta），环境变量对 driver 不生效，直接 patch
     try:
+        from playwright._impl._browser_type import BrowserType
+        _orig_launch_persistent = BrowserType.launch_persistent_context
+
+        async def _patched_launch_persistent_context(self, *args, _orig=_orig_launch_persistent, **kwargs):
+            # 默认参数 _orig 在定义时绑定，避免 frozen 下闭包丢失
+            # 调用方可能用 keyword 传 user_data_dir / userDataDir，需兼容且不重复传入
+            user_data_dir = kwargs.pop("user_data_dir", None) or kwargs.pop("userDataDir", None)
+            if user_data_dir is None and args:
+                user_data_dir = args[0]
+                args = args[1:]
+            # macOS Apple Silicon 上 bundled Chromium 为 x86（Rosetta）易 SEGV，改用本机 Chrome（ARM 原生）
+            if sys.platform == "darwin":
+                kwargs["channel"] = kwargs.get("channel") or "chrome"
+            # 仅当 headless=True 时强制旧版 headless，避免 macOS 上 --headless=new 崩溃
+            headless = kwargs.get("headless", True)
+            if headless:
+                ign = kwargs.get("ignore_default_args") or kwargs.get("ignoreDefaultArgs") or []
+                if ign is True:
+                    ign = ["--headless=new"]
+                else:
+                    ign = list(ign) if isinstance(ign, (list, tuple)) else []
+                    if "--headless=new" not in ign:
+                        ign.append("--headless=new")
+                kwargs.pop("ignore_default_args", None)
+                kwargs["ignoreDefaultArgs"] = ign
+                extra_args = list(kwargs.get("args") or [])
+                if "--headless" not in extra_args and "--headless=new" not in extra_args:
+                    extra_args.append("--headless")
+                kwargs["args"] = extra_args
+            return await _orig(self, user_data_dir, *args, **kwargs)
+
+        BrowserType.launch_persistent_context = _patched_launch_persistent_context
+        print("[run_media_login_with_qr] patch launch_persistent_context (old headless) ok", file=sys.stderr)
+    except Exception as e:
+        print(f"[run_media_login_with_qr] patch launch_persistent_context: {e}", file=sys.stderr)
+
+    try:
+        print("[run_media_login_with_qr] starting run(app_main)...", file=sys.stderr)
         run(app_main, async_cleanup, cleanup_timeout_seconds=15.0)
+        print("[run_media_login_with_qr] run() completed", file=sys.stderr)
     except SystemExit as e:
         if e.code not in (0, None):
             raise
     except Exception as e:
+        import traceback
         print(f"[run_media_login_with_qr] error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         raise
 
     # 脚本正常结束时再写一次 marker（patch 失败或非 xhs 时保底；扫码成功且 patch 生效时也会在结束时写一次，无害）

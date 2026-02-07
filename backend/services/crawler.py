@@ -15,7 +15,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__)
 
 def fetch_company_info(name):
     """委托给 enterprise_crawler"""
-    from services.enterprise_crawler import fetch_company_info as _fetch
+    from backend.services.enterprise_crawler import fetch_company_info as _fetch
     return _fetch(name)
 
 
@@ -28,7 +28,7 @@ def trigger_media_crawl(company_id, company_name, callback=None, on_error=None):
     """
     def _run():
         try:
-            from services.mediacrawler_service import (
+            from backend.services.mediacrawler_service import (
                 is_available,
                 crawl_by_keyword,
             )

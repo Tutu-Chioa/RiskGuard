@@ -211,7 +211,7 @@ const CompanyDetail = () => {
     rec.start();
   };
 
-  // 采集中时轮询刷新，完成后自动更新并提示（三灯：工商、相关新闻、社会评价）
+  // 采集中时轮询刷新，完成后自动更新并提示（三灯：工商、相关新闻、社会评价）；相关新闻完成后刷新新闻列表
   const wasRunning = useRef(false);
   useEffect(() => {
     const llm = company?.llm_status || '';
@@ -224,12 +224,13 @@ const CompanyDetail = () => {
       const err = llm === 'error' || news === 'error' || media === 'error';
       if (done && !err) toast.success('自动化流程已更新');
       else if (err) toast.error('部分任务异常，请检查配置后重试');
+      if (news === 'success') fetchCompanyNews();
     }
     if (isRunning) wasRunning.current = true;
     if (!isRunning) return;
     const t = setInterval(() => fetchCompanyDetails(false), 3000);
     return () => clearInterval(t);
-  }, [company?.llm_status, company?.news_status, company?.media_status, fetchCompanyDetails, toast]);
+  }, [company?.llm_status, company?.news_status, company?.media_status, fetchCompanyDetails, fetchCompanyNews, toast]);
 
   const handleCrawl = async () => {
     setCrawling(true);

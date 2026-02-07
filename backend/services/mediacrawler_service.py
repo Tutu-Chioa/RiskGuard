@@ -6,6 +6,7 @@ MediaCrawler 集成服务
 - 环境变量 MEDIACRAWLER_PATH 指向 MediaCrawler 项目根目录
 """
 import os
+import sys
 import json
 import subprocess
 import glob
@@ -21,16 +22,21 @@ def _get_path():
 def _get_mediacrawler_python():
     """
     优先返回 MediaCrawler 项目下的 venv Python，保证与扫码登录脚本同一环境、同一 cwd 语义。
-    这样爬取时 os.getcwd() 为 MC 根目录，browser_data 等路径与登录时一致，登录态可复用。
-    若未找到 venv 则返回 None，调用方回退到 uv run。
+    若未找到 venv 则返回 None，调用方回退到 uv run。兼容 Windows（Scripts/python.exe）与 Unix（bin/python）。
     """
     path = _get_path()
     if not path or not os.path.isdir(path):
         return None
-    for rel in ('.venv', 'venv'):
-        exe = os.path.join(path, rel, 'bin', 'python')
-        if os.path.isfile(exe):
-            return exe
+    if sys.platform == 'win32':
+        for rel in ('.venv', 'venv'):
+            exe = os.path.join(path, rel, 'Scripts', 'python.exe')
+            if os.path.isfile(exe):
+                return exe
+    else:
+        for rel in ('.venv', 'venv'):
+            exe = os.path.join(path, rel, 'bin', 'python')
+            if os.path.isfile(exe):
+                return exe
     return None
 
 def _get_platform():
@@ -58,26 +64,41 @@ def get_mediacrawler_python():
 
 
 def get_sessions_dir():
-    """本系统媒体爬虫登录态目录（与 app 中 _mediacrawler_sessions_dir 一致），创建后返回绝对路径。"""
-    base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'mediacrawler_sessions')
+    """本系统媒体爬虫登录态目录（与 app 中 _mediacrawler_sessions_dir 一致），创建后返回绝对路径。.app 下用 RISKGUARD_DATA_DIR。"""
+    data_root = os.environ.get('RISKGUARD_DATA_DIR', '').strip()
+    if not data_root:
+        data_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+    base = os.path.join(data_root, 'mediacrawler_sessions')
     os.makedirs(base, exist_ok=True)
     return os.path.abspath(base)
 
 
 def get_qr_dir():
-    """本系统二维码写入目录（与 app 中 _mediacrawler_qr_dir 一致），创建后返回绝对路径。"""
-    base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'mediacrawler_qr')
+    """本系统二维码写入目录（与 app 中 _mediacrawler_qr_dir 一致），创建后返回绝对路径。.app 下用 RISKGUARD_DATA_DIR。"""
+    data_root = os.environ.get('RISKGUARD_DATA_DIR', '').strip()
+    if not data_root:
+        data_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+    base = os.path.join(data_root, 'mediacrawler_qr')
     os.makedirs(base, exist_ok=True)
     return os.path.abspath(base)
+
+
+def _main_py_rel(mc_path):
+    """返回 MediaCrawler 根目录下 main 脚本的相对路径（兼容 PyInstaller 将 main.py 打成目录的情况）。"""
+    if not mc_path or not os.path.isdir(mc_path):
+        return None
+    main_py = os.path.join(mc_path, 'main.py')
+    if os.path.isfile(main_py):
+        return 'main.py'
+    if os.path.isfile(os.path.join(main_py, 'main.py')):
+        return 'main.py/main.py'
+    return None
 
 
 def is_available():
     """检查 MediaCrawler 是否可用"""
     path = _get_path()
-    if not path or not os.path.isdir(path):
-        return False
-    main_py = os.path.join(path, 'main.py')
-    return os.path.isfile(main_py)
+    return _main_py_rel(path) is not None
 
 
 def _platform_label(platform):
@@ -185,11 +206,10 @@ def _filter_reviews_by_keyword(reviews, keyword):
 def _copy_uploaded_sessions_to_mediacrawler(platform):
     """
     将本系统「上传的登录态」及扫码登录产生的 browser_data 等复制到 MediaCrawler 项目 data 目录，供爬虫使用。
-    本系统保存路径：backend/../data/mediacrawler_sessions/{platform}/
-    MediaCrawler 使用：MEDIACRAWLER_PATH/data/{platform}/ 或 getcwd()/browser_data/（爬取时 cwd=MC 根目录）
+    本系统保存路径：与 get_sessions_dir() 一致（.app 下为 RISKGUARD_DATA_DIR/mediacrawler_sessions/{platform}/）
+    MediaCrawler 使用：MEDIACRAWLER_PATH/data/{platform}/
     """
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    our_sessions = os.path.join(base_dir, 'data', 'mediacrawler_sessions', platform)
+    our_sessions = os.path.join(get_sessions_dir(), platform)
     if not os.path.isdir(our_sessions):
         return
     mc_path = _get_path()
@@ -243,13 +263,14 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
     # 使用用户上传的登录态（若有）
     _copy_uploaded_sessions_to_mediacrawler(platform)
     
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    our_sessions = os.path.join(base_dir, 'data', 'mediacrawler_sessions', platform)
+    # 会话目录与 app 一致，.app 下使用 RISKGUARD_DATA_DIR，否则使用项目 data/
+    our_sessions = os.path.join(get_sessions_dir(), platform)
     # 若存在「内嵌扫码登录」的 marker，爬取时使用 Playwright 以复用 browser_data 中的会话
     use_playwright = os.path.isfile(os.path.join(our_sessions, 'logged_in.txt'))
     
-    # MediaCrawler 仅支持 --save_data_option，不支持 --save_data_path；JSON 会写到 MediaCrawler 项目下的 data/{platform}，解析时用 mc_data_path 读取
-    save_path = os.path.abspath(os.path.join(base_dir, 'data', 'mediacrawler_output', platform))
+    # MediaCrawler 写入其 data/{platform}/；解析时先试本系统 mediacrawler_output，再试 MC data
+    data_root = os.path.dirname(get_sessions_dir())
+    save_path = os.path.abspath(os.path.join(data_root, 'mediacrawler_output', platform))
     os.makedirs(save_path, exist_ok=True)
     
     # 关键词：优先用企业名，避免 MediaCrawler 本地 config/KEYWORDS（如“登录”）覆盖
@@ -280,7 +301,6 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
         max_comments = max(0, min(20, max_comments))
     except (TypeError, ValueError):
         pass
-    py_exe = _get_mediacrawler_python()
     args = [
         '--platform', platform,
         '--lt', 'qrcode',
@@ -292,10 +312,83 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
         '--get_comment', 'true',
         '--max_comments_count_singlenotes', str(max_comments),
     ]
-    if py_exe:
-        cmd = [py_exe, 'main.py'] + args
+    # .app 内用同一可执行文件跑 MediaCrawler main.py；用临时脚本代替 -c 长字符串，避免打包/传参时被破坏导致 SyntaxError
+    if getattr(sys, 'frozen', False):
+        _data = os.environ.get('RISKGUARD_DATA_DIR', '')
+        if _data:
+            env['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(_data, 'playwright-browsers')
+        env['PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW'] = '0'
+        _main_rel = _main_py_rel(mc_path) or 'main.py'
+        env['MEDIACRAWLER_CRAWL_ARGS'] = '\n'.join(args)
+        env['MEDIACRAWLER_MAIN_REL'] = _main_rel
+        data_root = os.path.dirname(get_sessions_dir())
+        bootstrap_dir = os.path.join(data_root, 'mediacrawler_bootstrap')
+        os.makedirs(bootstrap_dir, exist_ok=True)
+        _bootstrap_py = os.path.join(bootstrap_dir, '_crawl_main.py')
+        # macOS 上与登录一致：patch Playwright 使用本机 Chrome，避免 x86 Chromium 在 Rosetta 下 mach_vm_read 崩溃
+        _playwright_patch = r'''
+try:
+    from playwright._impl._browser_type import BrowserType
+    _orig_lp = BrowserType.launch_persistent_context
+    async def _patched_lp(self, *args, _orig=_orig_lp, **kwargs):
+        user_data_dir = kwargs.pop("user_data_dir", None) or kwargs.pop("userDataDir", None)
+        if user_data_dir is None and args:
+            user_data_dir, args = args[0], args[1:]
+        if sys.platform == "darwin":
+            kwargs["channel"] = kwargs.get("channel") or "chrome"
+        headless = kwargs.get("headless", True)
+        if headless:
+            ign = kwargs.get("ignore_default_args") or kwargs.get("ignoreDefaultArgs") or []
+            ign = ["--headless=new"] if ign is True else list(ign) if isinstance(ign, (list, tuple)) else []
+            if "--headless=new" not in ign:
+                ign.append("--headless=new")
+            kwargs.pop("ignore_default_args", None)
+            kwargs["ignoreDefaultArgs"] = ign
+            extra = list(kwargs.get("args") or [])
+            if "--headless" not in extra and "--headless=new" not in extra:
+                extra.append("--headless")
+            kwargs["args"] = extra
+        return await _orig(self, user_data_dir, *args, **kwargs)
+    BrowserType.launch_persistent_context = _patched_lp
+except Exception:
+    pass
+'''
+        _bootstrap_content = '''# auto-generated crawl bootstrap
+import os, sys, runpy, types
+mc = os.environ.get("MEDIACRAWLER_PATH", "")
+if not mc:
+    sys.exit(1)
+os.chdir(mc)
+sys.path.insert(0, mc)
+try:
+    from sqlalchemy.orm import declarative_base as _db
+    import sqlalchemy.orm as _orm
+    _m = types.ModuleType("declarative")
+    _m.declarative_base = _db
+    _m.__file__ = getattr(_orm, "__file__", "")
+    sys.modules["sqlalchemy.ext.declarative"] = _m
+    import sqlalchemy.ext as _ext
+    _ext.declarative = _m
+except Exception:
+    pass
+''' + _playwright_patch + '''
+a = os.environ.get("MEDIACRAWLER_CRAWL_ARGS", "").split("\\n")
+rel = os.environ.get("MEDIACRAWLER_MAIN_REL", "main.py")
+sys.argv = [os.path.join(mc, rel)] + a
+runpy.run_path(rel, run_name="__main__")
+'''
+        try:
+            with open(_bootstrap_py, 'w', encoding='utf-8') as f:
+                f.write(_bootstrap_content)
+        except Exception:
+            return {'status': 'error', 'message': '无法写入爬虫引导脚本', 'reviews': []}
+        cmd = [sys.executable, _bootstrap_py]
     else:
-        cmd = ['uv', 'run', 'main.py'] + args
+        py_exe = _get_mediacrawler_python()
+        if py_exe:
+            cmd = [py_exe, 'main.py'] + args
+        else:
+            cmd = ['uv', 'run', 'main.py'] + args
     
     crawl_start = time.time()
     
@@ -306,23 +399,24 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
         except Exception:
             pass
     
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=mc_path,
-            env=env,
-            capture_output=True,
-            timeout=_get_timeout(),
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-        )
-    except FileNotFoundError:
-        # uv 或 venv python 不存在时，回退到系统 python（需在 MC 目录下可导入）
-        if not py_exe:
-            cmd = ['python3', 'main.py'] + args
-        else:
-            cmd = ['python3', 'main.py'] + args
+    def _clear_browser_lock():
+        if use_playwright and mc_path:
+            _ud = os.path.join(mc_path, 'browser_data', '{}_user_data_dir'.format(platform))
+            for _lock in ('SingletonLock', 'SingletonSocket', 'SingletonCookie'):
+                _fp = os.path.join(_ud, _lock)
+                try:
+                    if os.path.isfile(_fp):
+                        os.remove(_fp)
+                except Exception:
+                    pass
+
+    _clear_browser_lock()
+    proc = None
+    last_error = None
+    for attempt in range(2):
+        if attempt == 1:
+            _clear_browser_lock()
+            time.sleep(2)
         try:
             proc = subprocess.run(
                 cmd,
@@ -334,28 +428,43 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
                 encoding='utf-8',
                 errors='replace',
             )
-        except Exception as e:
+            break
+        except FileNotFoundError:
+            if getattr(sys, 'frozen', False):
+                _remove_keyword_file()
+                return {'status': 'error', 'message': 'MediaCrawler 执行失败（可执行文件未找到）', 'reviews': []}
+            cmd = ['python3', 'main.py'] + args
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=mc_path,
+                    env=env,
+                    capture_output=True,
+                    timeout=_get_timeout(),
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                )
+                break
+            except Exception as e:
+                _remove_keyword_file()
+                return {'status': 'error', 'message': '执行 MediaCrawler 失败: %s' % e, 'reviews': []}
+        except subprocess.TimeoutExpired:
             _remove_keyword_file()
-            return {
-                'status': 'error',
-                'message': f'执行 MediaCrawler 失败: {e}',
-                'reviews': []
-            }
-    except subprocess.TimeoutExpired:
+            return {'status': 'timeout', 'message': '爬取超时（%s 秒）' % _get_timeout(), 'reviews': []}
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                continue
+            _remove_keyword_file()
+            msg = str(e)
+            if 'SingletonLock' in msg or 'File exists' in msg or 'SingletonCookie' in msg:
+                msg += ' 请关闭所有 Chrome 窗口后重试；若已关闭仍报错，请在系统设置中清除登录态后重新扫码。'
+            return {'status': 'error', 'message': msg, 'reviews': []}
+    if proc is None:
         _remove_keyword_file()
-        return {
-            'status': 'timeout',
-            'message': f'爬取超时（{_get_timeout()}秒）',
-            'reviews': []
-        }
-    except Exception as e:
-        _remove_keyword_file()
-        return {
-            'status': 'error',
-            'message': str(e),
-            'reviews': []
-        }
-    
+        return {'status': 'error', 'message': last_error and str(last_error) or '爬取启动失败', 'reviews': []}
+
     # 优先只解析本次爬取新写入的 JSON（min_mtime），避免混入历史数据
     reviews = _parse_json_output(save_path, platform, company_name, min_mtime=crawl_start)
     if not reviews:
@@ -376,12 +485,10 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
     if not reviews:
         _remove_keyword_file()
         stderr_snippet = (getattr(proc, 'stderr', None) or '')[-1500:].strip() if proc else ''
-        return {
-            'status': 'no_content',
-            'message': '未解析到有效内容，请先扫码登录小红书（或当前平台）后再测试。可在本机运行 MediaCrawler 扫码后，在系统设置中上传 Cookie/Session。',
-            'reviews': [],
-            'crawl_stderr': stderr_snippet,
-        }
+        msg = '未解析到有效内容，请先扫码登录小红书（或当前平台）后再测试。可在本机运行 MediaCrawler 扫码后，在系统设置中上传 Cookie/Session。'
+        if stderr_snippet and ('SingletonLock' in stderr_snippet or 'File exists' in stderr_snippet):
+            msg += ' 若曾出现浏览器占用提示，请关闭所有 Chrome 窗口后重试。'
+        return {'status': 'no_content', 'message': msg, 'reviews': [], 'crawl_stderr': stderr_snippet}
     
     if callback and company_id is not None:
         callback(company_id, reviews)

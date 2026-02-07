@@ -2,6 +2,19 @@
 
 ## [未发布] - 2025-02-05
 
+### 稳定性、兼容性与轻量化（2025-02-07）
+
+- **稳定性**
+  - 媒体爬取失败时自动重试一次（先再次清理浏览器锁再重试），减少偶发锁占用导致的失败
+  - 爬取报错信息优化：若为 SingletonLock/File exists 类错误，提示「请关闭所有 Chrome 窗口后重试；若已关闭仍报错，请在系统设置中清除登录态后重新扫码」
+  - 未解析到内容且 stderr 含锁相关提示时，同样给出关闭 Chrome 的提示
+  - 桌面入口脚本路径规范化：爬取引导脚本参数使用 `normpath(abspath)`，避免路径格式导致误判
+- **兼容性**
+  - MediaCrawler 虚拟环境 Python 路径：支持 Windows（`Scripts/python.exe`）与 Unix（`bin/python`），便于日后在 Windows 上打包或本地运行
+- **轻量化**
+  - PyInstaller 打包时 MediaCrawler 仅打入运行所需：排除 `tests`、`test`、`docs`、`.github`、`examples`、`scripts` 及所有 `.md` 文件，减小 .app 体积
+  - Analysis 增加排除：`pytest`、`sphinx`、`IPython`、`notebook`，减少无用依赖进入 bundle
+
 ### 新增
 
 - **通知中心（站内消息）**

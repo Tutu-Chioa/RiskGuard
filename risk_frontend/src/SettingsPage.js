@@ -54,6 +54,9 @@ const SettingsPage = () => {
   const [reportTemplate, setReportTemplate] = useState('');
   const [crawlerTabPlatform, setCrawlerTabPlatform] = useState('xhs');
   const [crawlerLoginStatus, setCrawlerLoginStatus] = useState(null);
+  const [crawlerPath, setCrawlerPath] = useState('');
+  const [crawlerPathSaving, setCrawlerPathSaving] = useState(false);
+  const [crawlerPathMsg, setCrawlerPathMsg] = useState('');
   const [crawlerUploading, setCrawlerUploading] = useState(false);
   const [crawlerUploadMsg, setCrawlerUploadMsg] = useState('');
   const [crawlerTestResult, setCrawlerTestResult] = useState(null);
@@ -165,7 +168,7 @@ const SettingsPage = () => {
     }
   };
 
-  // 媒体爬虫登录状态（平台登录 tab）
+  // 媒体爬虫：登录状态 + 项目路径配置
   useEffect(() => {
     if (activeTab !== 'crawler') return;
     const token = localStorage.getItem('token');
@@ -173,6 +176,10 @@ const SettingsPage = () => {
       .then(r => r.ok ? r.json() : {})
       .then(d => setCrawlerLoginStatus(d))
       .catch(() => setCrawlerLoginStatus(null));
+    fetch('/api/mediacrawler/config', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setCrawlerPath(d.path || ''))
+      .catch(() => setCrawlerPath(''));
   }, [activeTab, crawlerTabPlatform]);
 
   const handleCrawlerUpload = (e) => {
@@ -278,6 +285,28 @@ const SettingsPage = () => {
     return () => clearTimeout(t);
   }, [qrcodeData]);
 
+  // 未拿到二维码时（例如只扫了弹窗 Chrome 里的码）也轮询登录状态，以便扫码后能检测到并收起「检测登录状态」
+  useEffect(() => {
+    if (activeTab !== 'crawler' || !qrStarting || qrcodeData) return;
+    const token = localStorage.getItem('token');
+    const id = setInterval(() => {
+      fetch(`/api/mediacrawler/login-status?platform=${crawlerTabPlatform}`, { headers: { Authorization: `Bearer ${token}` } })
+        .then(r => r.ok ? r.json() : {})
+        .then(d => {
+          if (d.status === 'has_session') {
+            if (qrPollRef.current) clearInterval(qrPollRef.current);
+            qrPollRef.current = null;
+            setQrcodeData(null);
+            setQrLoginSuccess(true);
+            setCrawlerLoginStatus(d);
+            setQrStarting(false);
+          }
+        })
+        .catch(() => {});
+    }, 1500);
+    return () => clearInterval(id);
+  }, [activeTab, crawlerTabPlatform, qrStarting, qrcodeData]);
+
   // 轮询超过约 2 分钟后降频并提示，避免长时间高频请求
   const [statusPollLongWait, setStatusPollLongWait] = useState(false);
 
@@ -294,6 +323,7 @@ const SettingsPage = () => {
           if (d.status === 'has_session') {
             if (statusPollRef.current) clearInterval(statusPollRef.current);
             statusPollRef.current = null;
+            setQrcodeData(null);
             setQrLoginSuccess(true);
             setCrawlerLoginStatus(d);
             setQrStarting(false);
@@ -1268,7 +1298,7 @@ const SettingsPage = () => {
                     value={llmConfig.base_url}
                     onChange={(e) => setLlmConfig({ ...llmConfig, base_url: e.target.value })}
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 theme-ring"
-                    placeholder="https://api.openai.com/v1 或兼容接口"
+                    placeholder="OpenAI: https://api.openai.com/v1；通义千问: https://dashscope.aliyuncs.com/compatible-mode/v1"
                   />
                 </div>
                 <div>
@@ -1343,6 +1373,44 @@ const SettingsPage = () => {
               <h2 className="text-xl font-bold text-gray-800 dark:text-gray-100 mb-6">平台登录（媒体爬虫）</h2>
               <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">在此页选择平台后点击「生成二维码」进行扫码登录；登录成功后可直接在服务器上爬取。若二维码方式不可用，也可在本机扫码后上传 Cookie/Session 文件。</p>
               <div className="space-y-4">
+                <div className="p-4 rounded-xl border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50">
+                  <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">MediaCrawler 项目路径</h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">指向克隆的 MediaCrawler 项目根目录（含 main.py）。.app 下在此保存后会自动写入应用数据目录，重启后仍生效。</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={crawlerPath}
+                      onChange={(e) => { setCrawlerPath(e.target.value); setCrawlerPathMsg(''); }}
+                      placeholder="/path/to/MediaCrawler 或 留空使用环境变量"
+                      className="flex-1 min-w-[200px] px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm"
+                    />
+                    <button
+                      type="button"
+                      disabled={crawlerPathSaving}
+                      onClick={async () => {
+                        setCrawlerPathSaving(true); setCrawlerPathMsg('');
+                        try {
+                          const token = localStorage.getItem('token');
+                          const res = await fetch('/api/mediacrawler/config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                            body: JSON.stringify({ path: crawlerPath })
+                          });
+                          const data = await res.json().catch(() => ({}));
+                          setCrawlerPathMsg(data.message || (data.ok ? '已保存' : data.message || '保存失败'));
+                        } catch (e) {
+                          setCrawlerPathMsg('保存失败: ' + e.message);
+                        } finally {
+                          setCrawlerPathSaving(false);
+                        }
+                      }}
+                      className="px-4 py-2 rounded-lg bg-[var(--primary-color)] text-white hover:opacity-90 disabled:opacity-50 text-sm"
+                    >
+                      {crawlerPathSaving ? '保存中…' : '保存路径'}
+                    </button>
+                  </div>
+                  {crawlerPathMsg && <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">{crawlerPathMsg}</p>}
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">选择平台</label>
                   <select

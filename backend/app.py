@@ -1,10 +1,11 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory, send_file
 from datetime import datetime, timedelta
 import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from functools import wraps
 import os
+import sys
 import json
 import subprocess
 import secrets
@@ -18,9 +19,27 @@ logger = logging.getLogger(__name__)
 
 # 从 backend/.env 加载环境变量（MEDIACRAWLER_PATH、SECRET_KEY、SMTP 等），无需每次手动 export
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_backend_dir)
+# .app 下再次确保含 backend 的目录在 path 最前（run_desktop 已设，此处兜底，避免 no module named 'services'）
+if getattr(sys, 'frozen', False):
+    _exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    _frameworks = os.path.abspath(os.path.join(_exe_dir, '..', 'Frameworks'))
+    if _frameworks not in sys.path:
+        sys.path.insert(0, _frameworks)
+    _meipass = getattr(sys, '_MEIPASS', '')
+    if _meipass and _meipass not in sys.path:
+        sys.path.insert(0, _meipass)
+# 打包为 Mac .app 或 PyInstaller 时使用用户目录存放数据库与上传，否则使用项目 data/
+_standalone_data = getattr(sys, 'frozen', False) or os.environ.get('STANDALONE_APP', '').strip() in ('1', 'true', 'yes')
+if _standalone_data:
+    _DATA_DIR = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'RiskGuard')
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    os.environ['RISKGUARD_DATA_DIR'] = _DATA_DIR
+else:
+    _DATA_DIR = os.path.join(_project_root, 'data')
 _env_path = os.path.join(_backend_dir, '.env')
 # 数据库路径与连接：统一 timeout 减少 "database is locked"
-_DB_PATH = os.path.join(os.path.dirname(_backend_dir), 'data', 'risk_platform.db')
+_DB_PATH = os.path.join(_DATA_DIR, 'risk_platform.db')
 def _db_conn(path=None, timeout=30):
     return sqlite3.connect(path or _DB_PATH, timeout=timeout)
 try:
@@ -49,6 +68,118 @@ if not os.environ.get('MEDIACRAWLER_PATH'):
         if os.path.isfile(os.path.join(_auto_mc, 'main.py')):
             os.environ['MEDIACRAWLER_PATH'] = _auto_mc
             break
+# .app/standalone 下从应用数据目录加载 .env（用户可在设置页保存 MEDIACRAWLER_PATH，写入此处）
+if _standalone_data:
+    _data_env = os.path.join(_DATA_DIR, '.env')
+    if os.path.isfile(_data_env):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(_data_env)
+        except Exception:
+            pass
+    if not os.environ.get('MEDIACRAWLER_PATH') and os.path.isfile(_data_env):
+        try:
+            with open(_data_env, 'r', encoding='utf-8') as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line.startswith('MEDIACRAWLER_PATH=') and not _line.startswith('#'):
+                        _val = _line.split('=', 1)[1].strip().strip('"\'')
+                        if _val:
+                            os.environ['MEDIACRAWLER_PATH'] = _val
+                        break
+        except Exception:
+            pass
+# .app 内嵌 MediaCrawler：frozen 时强制在首次运行把 bundle 中的 MediaCrawler 复制到应用数据目录，实现「安装即用」
+if getattr(sys, 'frozen', False):
+    _copied_mc = os.path.join(_DATA_DIR, 'MediaCrawler')
+    _need_copy = not os.path.isfile(os.path.join(_copied_mc, 'main.py'))
+    _bundled_mc = None
+    _exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+
+    def _check_mc(p):
+        if not p or not os.path.isdir(p):
+            return False
+        # PyInstaller 有时把 main.py 打成目录，其内才有 main.py 文件
+        main_py = os.path.join(p, 'main.py')
+        return os.path.isfile(main_py) or os.path.isfile(os.path.join(main_py, 'main.py'))
+    # 1) 用 __file__ 定位：app.py 在 .../Frameworks/backend/app.py，同级目录为 Frameworks，其下 MediaCrawler
+    _app_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _frameworks_from_file = os.path.join(os.path.dirname(_app_file_dir), 'MediaCrawler')
+    if _check_mc(_frameworks_from_file):
+        _bundled_mc = os.path.abspath(_frameworks_from_file)
+    # 2) 可执行文件在 Contents/MacOS，MediaCrawler 在 Contents/Frameworks
+    if not _bundled_mc:
+        _frameworks_mc = os.path.abspath(os.path.join(_exe_dir, '..', 'Frameworks', 'MediaCrawler'))
+        if _check_mc(_frameworks_mc):
+            _bundled_mc = _frameworks_mc
+    # 3) PyInstaller onedir：_MEIPASS 或可执行文件同目录
+    if not _bundled_mc:
+        _meipass = getattr(sys, '_MEIPASS', '')
+        if _meipass:
+            _m = os.path.join(_meipass, 'MediaCrawler')
+            if _check_mc(_m):
+                _bundled_mc = os.path.abspath(_m)
+    if not _bundled_mc:
+        _exe_sibling = os.path.join(_exe_dir, 'MediaCrawler')
+        if _check_mc(_exe_sibling):
+            _bundled_mc = os.path.abspath(_exe_sibling)
+    def _flatten_mc_dirs(root):
+        """PyInstaller 把路径打成「目录+同名文件」(如 database/db.py/ 内只有 db.py)，展平为正常文件。"""
+        try:
+            import shutil
+            to_replace = []
+            for dirpath, dirs, files in os.walk(root, topdown=False):
+                for d in dirs:
+                    p = os.path.join(dirpath, d)
+                    inner = os.path.join(p, d)
+                    if os.path.isfile(inner) and len(os.listdir(p)) == 1:
+                        to_replace.append((p, inner))
+            for parent_dir, inner_file in to_replace:
+                try:
+                    with open(inner_file, 'rb') as f:
+                        data = f.read()
+                    shutil.rmtree(parent_dir)
+                    with open(parent_dir, 'wb') as f:
+                        f.write(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if _bundled_mc and _need_copy:
+        try:
+            import shutil
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            if os.path.exists(_copied_mc):
+                shutil.rmtree(_copied_mc)
+            shutil.copytree(_bundled_mc, _copied_mc, symlinks=False, ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.DS_Store'))
+            _flatten_mc_dirs(_copied_mc)
+        except Exception:
+            pass
+    def _has_main(p):
+        if not p:
+            return False
+        mp = os.path.join(p, 'main.py')
+        return os.path.isfile(mp) or os.path.isfile(os.path.join(mp, 'main.py'))
+    # 已存在的复制目录也可能是未展平结构，每次启动时展平一次（幂等）
+    if _bundled_mc and os.path.isdir(_copied_mc):
+        _flatten_mc_dirs(_copied_mc)
+    # 优先用已复制到应用数据目录的路径（可写、持久）；若复制未成功则用 bundle 内路径，保证「已配置」可用
+    if _bundled_mc and os.path.isdir(_copied_mc) and _has_main(_copied_mc):
+        os.environ['MEDIACRAWLER_PATH'] = _copied_mc
+    elif _bundled_mc:
+        os.environ['MEDIACRAWLER_PATH'] = _bundled_mc
+    # 调试：写入解析结果，便于排查「未配置」（需用 .app 启动才会生成）
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        _log_path = os.path.join(_DATA_DIR, 'mediacrawler_resolve.log')
+        with open(_log_path, 'a', encoding='utf-8') as _lf:
+            _lf.write('%s frozen=1 exe_dir=%r __file__=%r bundled_mc=%r copied_ok=%s MEDIACRAWLER_PATH=%r\n' % (
+                datetime.now().isoformat(), _exe_dir, __file__, _bundled_mc,
+                _has_main(_copied_mc) if _copied_mc else False,
+                os.environ.get('MEDIACRAWLER_PATH', '')
+            ))
+    except Exception:
+        pass
 import smtplib
 import ssl
 import threading
@@ -70,7 +201,7 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-
 # 邮件发送：优先从管理后台配置（system_settings 表）读取 SMTP，若无则从环境变量读取
 def _get_smtp_config():
     """返回 SMTP 配置 dict：host, port, user, password, from_addr。优先数据库，其次环境变量。"""
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     out = {'host': '', 'port': 587, 'user': '', 'password': '', 'from_addr': ''}
     try:
         conn = sqlite3.connect(db_path)
@@ -110,7 +241,7 @@ def _smtp_configured():
     return bool(c.get('host') and c.get('user'))
 
 def _get_user_email(user_id):
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT email FROM users WHERE id=?", (user_id,))
     row = cursor.fetchone()
@@ -157,6 +288,9 @@ CORS(app, resources={
 @app.errorhandler(500)
 def internal_error(e):
     logger.exception('Internal server error')
+    # 静态资源或打包运行时返回真实错误便于排查白屏
+    if request.path.startswith('/static/') or getattr(sys, 'frozen', False):
+        return jsonify({'message': str(e), 'path': request.path}), 500
     if _is_production:
         return jsonify({'message': '服务器内部错误，请稍后再试'}), 500
     return jsonify({'message': str(e)}), 500
@@ -168,6 +302,8 @@ def handle_exception(e):
         logger.warning('Bad request: %s', e)
         return jsonify({'message': '请求参数错误' if _is_production else str(e)}), 400
     logger.exception('Unhandled exception')
+    if request.path.startswith('/static/') or getattr(sys, 'frozen', False):
+        return jsonify({'message': str(e), 'path': request.path}), 500
     if _is_production:
         return jsonify({'message': '服务器内部错误，请稍后再试'}), 500
     return jsonify({'message': str(e)}), 500
@@ -198,7 +334,7 @@ def _check_rate_limit():
 def health():
     """健康检查，供负载均衡或监控探测"""
     try:
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+        db_path = _DB_PATH
         if os.path.isfile(db_path):
             conn = sqlite3.connect(db_path)
             conn.cursor().execute('SELECT 1').fetchone()
@@ -212,14 +348,14 @@ def health():
 # Database initialization
 # 生产环境请设置 SKIP_DROP_TABLES=1 或 FLASK_ENV=production，仅执行迁移（加表/加列），不 DROP 表
 def init_db():
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'), timeout=30)
+    conn = sqlite3.connect(_DB_PATH, timeout=30)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")  # 允许读与写并发，减轻 database is locked
     skip_drop = os.environ.get('SKIP_DROP_TABLES', '').strip() in ('1', 'true', 'yes') or os.environ.get('FLASK_ENV') == 'production'
 
     if not skip_drop:
         # 开发环境：先删依赖 companies 的表，再删 companies，避免重启后「最新企业资讯」仍显示已删企业
-        for t in ('risk_alerts', 'company_media_reviews', 'company_news', 'company_keywords', 'user_company_favorites'):
+        for t in ('risk_alerts', 'company_media_reviews', 'company_news', 'company_keywords', 'user_company_favorites', 'user_companies'):
             cursor.execute("DROP TABLE IF EXISTS " + t)
         cursor.execute("DROP TABLE IF EXISTS risk_insights")
         cursor.execute("DROP TABLE IF EXISTS news_items")
@@ -228,7 +364,57 @@ def init_db():
         cursor.execute("DROP TABLE IF EXISTS companies")
         cursor.execute("DROP TABLE IF EXISTS users")
 
-    # 生产环境（skip_drop）仅执行下方 CREATE TABLE IF NOT EXISTS 与 ALTER；开发环境则创建表并插入示例数据
+    # 生产环境（skip_drop）也需确保 users/companies 等核心表存在（新建数据目录时）
+    if skip_drop:
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            industry TEXT,
+            risk_level TEXT DEFAULT '未知',
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            legal_representative TEXT,
+            registered_capital TEXT,
+            business_status TEXT,
+            registered_address TEXT,
+            business_scope TEXT,
+            equity_structure TEXT,
+            social_evaluation TEXT,
+            crawl_status TEXT DEFAULT 'pending',
+            established_date TEXT,
+            legal_cases TEXT,
+            equity_changes TEXT,
+            capital_changes TEXT
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS risk_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER,
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            description TEXT,
+            source TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (company_id) REFERENCES companies (id)
+        )
+        ''')
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                ("admin", "admin@example.com", generate_password_hash("admin123"), "admin"))
+        conn.commit()
+    # 开发环境：创建表并插入示例数据
     if not skip_drop:
         # Users table
         cursor.execute('''
@@ -394,7 +580,7 @@ def init_db():
             conn.commit()
         except sqlite3.OperationalError:
             pass
-    # 用户收藏企业表
+    # 用户收藏企业表（红心：仅影响是否标星，取消收藏后企业仍在「我的企业」中）
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_company_favorites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,6 +592,22 @@ def init_db():
             FOREIGN KEY (company_id) REFERENCES companies (id)
         )
     ''')
+    # 用户关联企业表：用户添加的企业（与收藏分离，取消红心后企业仍可见）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_companies (
+            user_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, company_id),
+            FOREIGN KEY (user_id) REFERENCES users (id),
+            FOREIGN KEY (company_id) REFERENCES companies (id)
+        )
+    ''')
+    try:
+        cursor.execute("INSERT OR IGNORE INTO user_companies (user_id, company_id) SELECT user_id, company_id FROM user_company_favorites")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # 用户提交链接表
     # 企业关键词（词云）
     cursor.execute('''
@@ -648,7 +850,7 @@ def admin_required(f):
     """要求当前用户为 admin 角色，与 token_required 同时使用：先 token_required 再 admin_required"""
     @wraps(f)
     def decorated(current_user_id, *args, **kwargs):
-        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+        conn = sqlite3.connect(_DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT role FROM users WHERE id = ?", (current_user_id,))
         row = cur.fetchone()
@@ -661,8 +863,8 @@ def admin_required(f):
 
 
 def _user_company_ids(cursor, user_id):
-    """返回当前用户有权限且仍存在的企业 id 列表，用于数据隔离。只含 companies 表里仍存在的 id，避免删除/重建企业后仍显示其资讯。"""
-    cursor.execute("""SELECT u.company_id FROM user_company_favorites u
+    """返回当前用户关联且仍存在的企业 id 列表（user_companies），用于数据隔离。"""
+    cursor.execute("""SELECT u.company_id FROM user_companies u
                       INNER JOIN companies c ON c.id = u.company_id
                       WHERE u.user_id = ?""", (user_id,))
     return [row[0] for row in cursor.fetchall()]
@@ -721,7 +923,7 @@ def login():
     username = data.get('username')
     password = data.get('password')
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, username, password_hash, role, two_factor_enabled FROM users WHERE username=?",
@@ -790,7 +992,7 @@ def _temp_2fa_token_required(f):
 def two_fa_setup(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT username FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -824,7 +1026,7 @@ def two_fa_verify(current_user_id):
     code = (data.get('code') or '').strip().replace(' ', '')
     if not code or len(code) != 6:
         return jsonify({'message': '请输入 6 位验证码'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT two_factor_secret FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -834,7 +1036,7 @@ def two_fa_verify(current_user_id):
     totp = pyotp.TOTP(row[0])
     if not totp.verify(code, valid_window=1):
         return jsonify({'message': '验证码错误或已过期'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET two_factor_enabled=1 WHERE id=?", (current_user_id,))
     conn.commit()
@@ -851,13 +1053,13 @@ def two_fa_disable(current_user_id):
     code = (data.get('code') or '').strip().replace(' ', '')
     if not code or len(code) != 6:
         return jsonify({'message': '请输入 6 位验证码'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT two_factor_secret FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
     conn.close()
     if not row or not row[0]:
-        conn2 = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+        conn2 = sqlite3.connect(_DB_PATH)
         cur = conn2.cursor()
         cur.execute("UPDATE users SET two_factor_enabled=0, two_factor_secret=NULL WHERE id=?", (current_user_id,))
         conn2.commit()
@@ -867,7 +1069,7 @@ def two_fa_disable(current_user_id):
     totp = pyotp.TOTP(row[0])
     if not totp.verify(code, valid_window=1):
         return jsonify({'message': '验证码错误或已过期'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET two_factor_enabled=0, two_factor_secret=NULL WHERE id=?", (current_user_id,))
     conn.commit()
@@ -885,7 +1087,7 @@ def two_fa_verify_login(current_user_id):
     code = (data.get('code') or '').strip().replace(' ', '')
     if not code or len(code) != 6:
         return jsonify({'message': '请输入 6 位验证码'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT username, role, two_factor_secret FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -913,7 +1115,7 @@ def two_fa_verify_login(current_user_id):
 def auth_me(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id, username, email, role, created_at FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -947,7 +1149,7 @@ def change_password(current_user_id):
     new_pwd = data.get('new_password')
     if not old_pwd or not new_pwd:
         return jsonify({'detail': '缺少参数'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT password_hash FROM users WHERE id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -970,7 +1172,7 @@ def update_profile(current_user_id):
     alert_threshold = data.get('alert_threshold')
     backup_enabled = data.get('backup_enabled')
     backup_frequency = data.get('backup_frequency')
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         if username is not None:
@@ -1011,7 +1213,7 @@ def update_profile(current_user_id):
 def backup_status(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM system_settings WHERE key=?", ('last_backup',))
     row = cursor.fetchone()
@@ -1030,7 +1232,7 @@ def forgot_password():
     email = (data.get('email') or '').strip()
     if not email:
         return jsonify({'message': '请提供邮箱'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM users WHERE email=?", (email,))
     row = cursor.fetchone()
@@ -1077,7 +1279,7 @@ def reset_password():
     new_password = data.get('new_password') or data.get('password') or ''
     if not token or not new_password:
         return jsonify({'message': '请提供重置令牌和新密码'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT id, reset_token_expires FROM users WHERE reset_token=?", (token,))
@@ -1115,7 +1317,7 @@ def register():
     email = data.get('email')
     password = data.get('password')
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     
     try:
@@ -1165,7 +1367,7 @@ def send_risk_digest(current_user_id):
     """向当前用户邮箱发送风险速览（高风险企业数量等）。"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT risk_level, COUNT(*) FROM companies GROUP BY risk_level")
     rows = cursor.fetchall()
@@ -1202,7 +1404,7 @@ def get_news(current_user_id):
     skip = int(request.args.get('skip', 0))
     limit = int(request.args.get('limit', 10))
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     
     query = "SELECT id, title, content, category, source_url, scraped_at, created_at FROM news_items WHERE user_id = ?"
@@ -1243,7 +1445,7 @@ def get_risk_insights(current_user_id):
     skip = int(request.args.get('skip', 0))
     limit = int(request.args.get('limit', 10))
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     
     query = "SELECT id, title, description, content, risk_level, generated_at, created_at FROM risk_insights WHERE user_id = ?"
@@ -1281,7 +1483,7 @@ def get_macro_policy_digest(current_user_id):
     """获取最新的宏观政策摘要（大模型每日更新）"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute(
@@ -1306,7 +1508,7 @@ def refresh_macro_policy_digest_api(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
     try:
-        from services.scheduler_service import refresh_macro_policy_digest
+        from backend.services.scheduler_service import refresh_macro_policy_digest
         ok, msg = refresh_macro_policy_digest()
         if ok:
             return jsonify({'success': True, 'message': msg or '已更新'})
@@ -1321,7 +1523,7 @@ def get_macro_policy_news(current_user_id):
     """获取政策与市场环境新闻列表（多维度、每条单独，定时自动更新）"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     try:
@@ -1353,7 +1555,7 @@ def add_test_data(current_user_id):
         return jsonify({})
         
     # Add test news data if not exists
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     
     # Check if test data already exists for this user
@@ -1411,12 +1613,13 @@ def get_companies(current_user_id):
                   'risk_level': "CASE WHEN c.risk_level='高' THEN 1 WHEN c.risk_level='中' THEN 2 ELSE 3 END, c.name ASC"}
     order_clause = valid_sorts.get(sort, valid_sorts['last_updated'])
 
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT company_id FROM user_company_favorites WHERE user_id=?", (current_user_id,))
     fav_ids = {r[0] for r in cursor.fetchall()}
 
-    where_parts = ["c.id IN (SELECT company_id FROM user_company_favorites WHERE user_id = ?)"]
+    # 基础列表：用户关联的企业（user_companies）；favorite_only 时再限定为收藏
+    where_parts = ["c.id IN (SELECT company_id FROM user_companies WHERE user_id = ?)"]
     params = [current_user_id]
     if search:
         where_parts.append("(c.name LIKE ? OR c.legal_representative LIKE ?)")
@@ -1429,7 +1632,7 @@ def get_companies(current_user_id):
         params.extend(['%' + industry + '%', industry])
     if favorite_only:
         where_parts.append("c.id IN (SELECT company_id FROM user_company_favorites WHERE user_id = ?)")
-        params.append(current_user_id)
+        params.append(current_user_id)  # 仅显示收藏的企业
     where_sql = " AND ".join(where_parts) if where_parts else "1=1"
 
     try:
@@ -1485,7 +1688,7 @@ def get_company_industries(current_user_id):
     """返回当前用户企业的行业列表（用于筛选下拉）"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
@@ -1504,7 +1707,7 @@ def get_company(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
         
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     
     try:
@@ -1531,7 +1734,7 @@ def get_company(current_user_id, company_id):
     if not company:
         conn.close()
         return jsonify({'message': 'Company not found'}), 404
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if cursor.fetchone() is None:
         logger.info('Company access denied: user_id=%s company_id=%s', current_user_id, company_id)
         conn.close()
@@ -1558,7 +1761,7 @@ def get_company(current_user_id, company_id):
     except Exception:
         llm_s = media_s = news_s = 'pending'
     cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
-    is_fav = cursor.fetchone() is not None  # 已在上方校验过，此处必为 True
+    is_fav = cursor.fetchone() is not None
     n = len(company)
     result = {
         'id': company[0],
@@ -1636,14 +1839,14 @@ def add_company(current_user_id):
             (name, industry)
         )
         company_id = cursor.lastrowid
-        cursor.execute("INSERT OR IGNORE INTO user_company_favorites (user_id, company_id) VALUES (?, ?)", (current_user_id, company_id))
+        cursor.execute("INSERT OR IGNORE INTO user_companies (user_id, company_id) VALUES (?, ?)", (current_user_id, company_id))
         conn.commit()
         conn.close()
         
         def _crawl_and_update():
             try:
-                from services.crawler import fetch_company_info, trigger_media_crawl
-                from services.llm_service import fetch_company_info_by_llm
+                from backend.services.crawler import fetch_company_info, trigger_media_crawl
+                from backend.services.llm_service import fetch_company_info_by_llm
                 # 步骤 0：更新状态，立即关闭连接，避免长时间持锁
                 c0 = _db_conn()
                 cur0 = c0.cursor()
@@ -1663,7 +1866,7 @@ def add_company(current_user_id):
                     print('[工商信息] 使用 LLM 联网搜索，base_url=%s model=%s enable_web=%s' % (base_url or '(默认)', model, enable_web_search))
 
                 # 1) 企业工商信息：先调 LLM/爬虫（不持库连接），再写库
-                from services.crawler import fetch_company_info
+                from backend.services.crawler import fetch_company_info
                 info = None
                 llm_ok = False
                 if api_key:
@@ -1709,7 +1912,7 @@ def add_company(current_user_id):
                 news_list = None
                 try:
                     if api_key and str(api_key).strip():
-                        from services.llm_service import search_company_news
+                        from backend.services.llm_service import search_company_news
                         news_list = search_company_news(name, api_key, base_url or '', model or 'gpt-4o-mini', enable_web_search=enable_web_search)
                 except Exception as ne:
                     print('[相关新闻] 搜索异常:', ne)
@@ -1750,7 +1953,7 @@ def add_company(current_user_id):
                 c3.close()
 
                 def _save_reviews(cid, reviews):
-                    from services.media_review_store import save_media_reviews_dedup
+                    from backend.services.media_review_store import save_media_reviews_dedup
                     save_media_reviews_dedup(_DB_PATH, cid, name, reviews, api_key, base_url, model)
                 def _on_media_error(cid):
                     cx = _db_conn()
@@ -1796,9 +1999,9 @@ def update_company(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
     data = request.get_json() or {}
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         logger.info('Company update denied: user_id=%s company_id=%s', current_user_id, company_id)
         conn.close()
@@ -1833,12 +2036,16 @@ def update_company(current_user_id, company_id):
 def toggle_company_favorite(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM companies WHERE id=?", (company_id,))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': 'Company not found'}), 404
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'message': '无权限操作该企业'}), 403
     cursor.execute("SELECT id FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     exists = cursor.fetchone()
     if exists:
@@ -1857,9 +2064,9 @@ def toggle_company_favorite(current_user_id, company_id):
 def delete_company(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         logger.info('Company delete denied: user_id=%s company_id=%s', current_user_id, company_id)
         conn.close()
@@ -1867,12 +2074,13 @@ def delete_company(current_user_id, company_id):
     cursor.execute("SELECT name FROM companies WHERE id=?", (company_id,))
     row = cursor.fetchone()
     company_name = row[0] if row else str(company_id)
-    # 与公司严格绑定：删除该公司相关的警报、媒体评价、相关资讯、关键词，再删公司
+    # 与公司严格绑定：删除该公司相关的警报、媒体评价、相关资讯、关键词、用户关联与收藏，再删公司
     cursor.execute("DELETE FROM risk_alerts WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM company_keywords WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM user_company_favorites WHERE company_id=?", (company_id,))
+    cursor.execute("DELETE FROM user_companies WHERE company_id=?", (company_id,))
     cursor.execute("DELETE FROM companies WHERE id=?", (company_id,))
     conn.commit()
     _audit_log(current_user_id, 'delete_company', 'company', company_id, company_name, cursor_=cursor, conn=conn)
@@ -1884,9 +2092,9 @@ def delete_company(current_user_id, company_id):
 def trigger_company_crawl(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         logger.info('Company crawl denied: user_id=%s company_id=%s', current_user_id, company_id)
         conn.close()
@@ -1897,9 +2105,9 @@ def trigger_company_crawl(current_user_id, company_id):
     if not row:
         return jsonify({'message': 'Company not found'}), 404
     try:
-        from services.crawler import trigger_media_crawl
-        from services.llm_service import analyze_sentiment_and_keywords, fetch_company_info_by_llm
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+        from backend.services.crawler import trigger_media_crawl
+        from backend.services.llm_service import analyze_sentiment_and_keywords, fetch_company_info_by_llm
+        db_path = _DB_PATH
         conn2 = sqlite3.connect(db_path)
         cur = conn2.cursor()
         cur.execute("UPDATE companies SET llm_status='running', media_status='pending' WHERE id=?", (company_id,))
@@ -1912,7 +2120,7 @@ def trigger_company_crawl(current_user_id, company_id):
             api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
             enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
         # 企业工商、法律等信息：仅用大模型联网搜索
-        from services.crawler import fetch_company_info
+        from backend.services.crawler import fetch_company_info
         info = None
         llm_ok = False
         if api_key:
@@ -1949,7 +2157,7 @@ def trigger_company_crawl(current_user_id, company_id):
         conn2.commit()
 
         def _save_reviews(cid, reviews):
-            from services.media_review_store import save_media_reviews_dedup
+            from backend.services.media_review_store import save_media_reviews_dedup
             save_media_reviews_dedup(db_path, cid, row[0], reviews, api_key, base_url, model)
 
         def _on_media_error(cid):
@@ -1979,7 +2187,7 @@ def search_company_news_api(current_user_id, company_id):
     """大模型联网搜索企业相关新闻，整理后保存到 company_news"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM companies WHERE id=?", (company_id,))
     row = cursor.fetchone()
@@ -1993,7 +2201,7 @@ def search_company_news_api(current_user_id, company_id):
         return jsonify({'message': '请先在系统设置中配置 LLM API 并开启联网搜索'}), 400
     api_key, base_url, model = llm_row[0], llm_row[1] or '', llm_row[2] or 'gpt-4o-mini'
     enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn0 = _db_conn()
     cur0 = conn0.cursor()
     cur0.execute("INSERT INTO task_runs (task_type, company_id, status, message) VALUES (?,?,?,?)", ('news_search', company_id, 'running', '大模型搜索相关新闻'))
@@ -2001,7 +2209,7 @@ def search_company_news_api(current_user_id, company_id):
     task_run_id = cur0.lastrowid
     conn0.close()
     try:
-        from services.llm_service import search_company_news
+        from backend.services.llm_service import search_company_news
         news_list = search_company_news(row[0], api_key, base_url, model, enable_web_search=enable_web_search)
         conn2 = sqlite3.connect(db_path)
         cur = conn2.cursor()
@@ -2044,7 +2252,7 @@ def clear_company_news(current_user_id, company_id):
         return jsonify({})
     conn = _db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -2068,7 +2276,7 @@ def export_company_report(current_user_id, company_id):
         return jsonify({})
     conn = _db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -2128,10 +2336,10 @@ def export_company_excel(current_user_id, company_id):
         return jsonify({'message': '服务端未安装 openpyxl，请使用 TXT 导出'}), 503
     from flask import send_file
     import io
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn = _db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -2218,7 +2426,7 @@ def export_company_pdf(current_user_id, company_id):
         return jsonify({'message': '服务端未安装 reportlab，请使用 TXT 或 Excel 导出'}), 503
     conn = _db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -2279,7 +2487,7 @@ def export_company_pdf(current_user_id, company_id):
 def get_llm_config(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -2297,7 +2505,7 @@ def put_llm_config(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
     data = request.get_json() or {}
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     enable_web = 1 if data.get('enable_web_search') else 0
     cursor.execute("""INSERT OR REPLACE INTO llm_config (user_id, api_key, base_url, model, enable_web_search, updated_at)
@@ -2315,7 +2523,7 @@ def test_llm_company(current_user_id):
         return jsonify({})
     data = request.get_json() or {}
     name = data.get('name', '美团')
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
     row = cur.fetchone()
@@ -2329,7 +2537,7 @@ def test_llm_company(current_user_id):
     api_key, base_url, model = row[0], row[1] or '', row[2] or 'gpt-4o-mini'
     enable_web_search = bool(row[3]) if len(row) > 3 else False
     try:
-        from services.llm_service import fetch_company_info_by_llm
+        from backend.services.llm_service import fetch_company_info_by_llm
         result = fetch_company_info_by_llm(name, api_key, base_url, model, enable_web_search=enable_web_search)
         if result:
             return jsonify({
@@ -2363,7 +2571,7 @@ def get_system_status(current_user_id):
     services.append({'id': 'backend', 'name': '后端 API', 'endpoint': base_url, 'status': 'online'})
     # 2. 数据库
     try:
-        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+        conn = sqlite3.connect(_DB_PATH)
         conn.execute("SELECT 1")
         conn.close()
         services.append({'id': 'database', 'name': '数据库', 'endpoint': 'SQLite', 'status': 'online'})
@@ -2371,7 +2579,7 @@ def get_system_status(current_user_id):
         services.append({'id': 'database', 'name': '数据库', 'endpoint': 'SQLite', 'status': 'offline', 'message': str(e)[:50]})
     # 3. 企业信息（LLM/爬虫）
     try:
-        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+        conn = sqlite3.connect(_DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT api_key, enable_web_search FROM llm_config WHERE api_key IS NOT NULL AND api_key != '' LIMIT 1")
         row = cur.fetchone()
@@ -2385,7 +2593,7 @@ def get_system_status(current_user_id):
         services.append({'id': 'llm', 'name': '大模型', 'endpoint': '-', 'status': 'offline', 'message': str(e)[:50]})
     # 4. MediaCrawler
     try:
-        from services.mediacrawler_service import is_available
+        from backend.services.mediacrawler_service import is_available
         av = is_available()
         services.append({'id': 'mediacrawler', 'name': '媒体爬虫', 'endpoint': 'MediaCrawler', 'status': 'online' if av else 'offline', 'message': '已配置' if av else '请设置 MEDIACRAWLER_PATH'})
     except Exception as e:
@@ -2412,7 +2620,7 @@ def get_mediacrawler_status(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
     try:
-        from services.mediacrawler_service import is_available, get_mediacrawler_path, get_mediacrawler_platform
+        from backend.services.mediacrawler_service import is_available, get_mediacrawler_path, get_mediacrawler_platform
         available = is_available()
         return jsonify({
             'available': available,
@@ -2424,13 +2632,44 @@ def get_mediacrawler_status(current_user_id):
         return jsonify({'available': False, 'path': '', 'platform': 'xhs', 'message': str(e)})
 
 
+@app.route('/api/mediacrawler/config', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+def mediacrawler_config(current_user_id):
+    """GET 返回当前 MediaCrawler 路径；POST 保存路径（.app 下写入应用数据目录 .env）"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    if request.method == 'GET':
+        path = os.environ.get('MEDIACRAWLER_PATH', '').strip()
+        return jsonify({'path': path})
+    # POST
+    data = request.get_json() or {}
+    path = (data.get('path') or '').strip()
+    path_ok = path and os.path.isdir(path) and os.path.isfile(os.path.join(path, 'main.py'))
+    if _standalone_data:
+        _data_env = os.path.join(_DATA_DIR, '.env')
+        try:
+            _lines = []
+            if os.path.isfile(_data_env):
+                with open(_data_env, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip().startswith('MEDIACRAWLER_PATH='):
+                            _lines.append(line.rstrip('\n'))
+            _lines.append('MEDIACRAWLER_PATH=%s' % path.replace('\\', '/'))
+            with open(_data_env, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(_lines) + '\n')
+        except Exception as e:
+            return jsonify({'ok': False, 'message': '写入配置失败: %s' % e}), 500
+    os.environ['MEDIACRAWLER_PATH'] = path
+    return jsonify({'ok': True, 'path': path, 'valid': path_ok, 'message': '已保存；路径有效，可使用媒体爬虫' if path_ok else '已保存；请确认路径指向 MediaCrawler 项目根目录（含 main.py）'})
+
+
 def _mediacrawler_sessions_dir():
-    from services.mediacrawler_service import get_sessions_dir
+    from backend.services.mediacrawler_service import get_sessions_dir
     return get_sessions_dir()
 
 
 def _mediacrawler_qr_dir():
-    from services.mediacrawler_service import get_qr_dir
+    from backend.services.mediacrawler_service import get_qr_dir
     return get_qr_dir()
 
 
@@ -2478,7 +2717,8 @@ def mediacrawler_start_login(current_user_id):
     qr_file = os.path.abspath(os.path.join(qr_dir, f'{platform}.txt'))
     sessions_dir = os.path.abspath(_mediacrawler_sessions_dir())
     script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'scripts', 'run_media_login_with_qr.py'))
-    if not os.path.isfile(script_path):
+    # frozen 时用 -m backend.scripts.run_media_login_with_qr，脚本在 PYZ 内，无需磁盘上的 .py 文件
+    if not getattr(sys, 'frozen', False) and not os.path.isfile(script_path):
         return jsonify({'started': False, 'message': '登录脚本不存在'}), 500
     if force_new:
         platform_session = os.path.join(sessions_dir, platform)
@@ -2506,18 +2746,53 @@ def mediacrawler_start_login(current_user_id):
     env['MEDIACRAWLER_QR_FILE'] = qr_file
     env['SYS2_SESSIONS_DIR'] = sessions_dir
     env['PLATFORM'] = platform
-    from services.mediacrawler_service import get_mediacrawler_python
-    py_exe = get_mediacrawler_python()
-    if not py_exe or not os.path.isfile(py_exe):
-        py_exe = 'python3'
-    # 将登录脚本 stderr 写入文件，便于排查 patch 失败、未扫码等（脚本未结束前 PIPE 读不到）
+    # .app 内用同一可执行文件跑登录脚本；Playwright 浏览器装到应用数据目录，首次自动 install
+    if getattr(sys, 'frozen', False):
+        _pw_browsers = os.path.join(_DATA_DIR, 'playwright-browsers')
+        env['PLAYWRIGHT_BROWSERS_PATH'] = _pw_browsers
+        # macOS 上新 headless 易崩溃（mach_vm_read / crash info version 7），强制用旧模式
+        env['PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW'] = '0'
+        _pw_marker = os.path.join(_DATA_DIR, '.playwright_installed')
+        _chromium_ok = os.path.isdir(_pw_browsers) and any(
+            'chromium' in n.lower() for n in (os.listdir(_pw_browsers) if os.path.isdir(_pw_browsers) else [])
+        )
+        if not _chromium_ok or not os.path.isfile(_pw_marker):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+                    env=env, timeout=180, capture_output=True, text=True
+                )
+                _chromium_ok = proc.returncode == 0 and os.path.isdir(_pw_browsers)
+                if _chromium_ok:
+                    with open(_pw_marker, 'w') as _f:
+                        _f.write('1')
+                elif proc.returncode != 0 and proc.stderr:
+                    logger.warning('playwright install chromium failed: %s', proc.stderr[:500])
+            except Exception as e:
+                logger.warning('playwright install chromium exception: %s', e)
+            _chromium_ok = _chromium_ok or (os.path.isdir(_pw_browsers) and any(
+                'chromium' in n.lower() for n in (os.listdir(_pw_browsers) if os.path.isdir(_pw_browsers) else [])
+            ))
+        if not _chromium_ok:
+            return jsonify({
+                'started': False,
+                'message': 'Chromium 未安装成功，无法生成二维码。请确保网络正常后重试；或在本机终端执行：PLAYWRIGHT_BROWSERS_PATH="%s" "%s" -m playwright install chromium' % (_pw_browsers, sys.executable)
+            }), 400
+        env['RISKGUARD_LOGIN_SUBPROCESS'] = '1'
+        run_argv = [sys.executable, '-m', 'backend.scripts.run_media_login_with_qr']
+    else:
+        from backend.services.mediacrawler_service import get_mediacrawler_python
+        py_exe = get_mediacrawler_python()
+        if not py_exe or not os.path.isfile(py_exe):
+            py_exe = 'python3'
+        run_argv = [py_exe, script_path]
     platform_session = os.path.join(sessions_dir, platform)
     os.makedirs(platform_session, exist_ok=True)
     stderr_log = os.path.join(platform_session, "login_stderr.log")
     try:
         with open(stderr_log, "w", encoding="utf-8") as stderr_f:
             proc = subprocess.Popen(
-                [py_exe, script_path],
+                run_argv,
                 cwd=os.path.abspath(mc_path),
                 env=env,
                 stdout=subprocess.DEVNULL,
@@ -2654,7 +2929,7 @@ def mediacrawler_test_crawl(current_user_id):
     keyword = (data.get('keyword') or '美团').strip() or '美团'
     platform = (data.get('platform') or 'xhs').strip() or 'xhs'
     try:
-        from services.mediacrawler_service import is_available, crawl_by_keyword
+        from backend.services.mediacrawler_service import is_available, crawl_by_keyword
         if not is_available():
             return jsonify({
                 'ok': False,
@@ -2701,7 +2976,7 @@ def get_rolling_news(current_user_id):
             filter_company_id = int(company_id_raw)
         except (TypeError, ValueError):
             return jsonify([])
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         cids = _user_company_ids(cursor, current_user_id)
@@ -2758,7 +3033,7 @@ def get_rolling_news(current_user_id):
 def get_dashboard(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
@@ -2809,7 +3084,7 @@ def get_dashboard_risk_distribution(current_user_id):
     """企业风险等级分布（用于仪表盘图表），仅统计当前用户企业"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
@@ -2857,7 +3132,7 @@ def search(current_user_id):
     q = (request.args.get('q') or '').strip()
     if not q:
         return jsonify({'companies': [], 'news': []})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cids = _user_company_ids(cursor, current_user_id)
     if not cids:
@@ -2879,13 +3154,13 @@ def search(current_user_id):
 def get_company_wordcloud(current_user_id, company_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT keyword, weight FROM company_keywords WHERE company_id=?", (company_id,))
     keywords = [{'word': r[0], 'weight': r[1]} for r in cursor.fetchall()]
     conn.close()
     try:
-        from services.wordcloud_service import generate_wordcloud
+        from backend.services.wordcloud_service import generate_wordcloud
         img = generate_wordcloud(keywords)
         if img:
             return jsonify({'image': img})
@@ -2900,9 +3175,9 @@ def get_company_supplements(current_user_id, company_id):
     """获取企业尽调补充对话历史"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限访问该企业'}), 403
@@ -2931,10 +3206,10 @@ def supplement_chat(current_user_id, company_id):
         return jsonify({'message': '请输入补充内容'}), 400
     if len(text) > 5000:
         return jsonify({'message': '补充内容不超过 5000 字'}), 400
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -2957,7 +3232,7 @@ def supplement_chat(current_user_id, company_id):
     conn.close()
     if not llm_row or not (llm_row[0] and str(llm_row[0]).strip()):
         return jsonify({'message': '请先在系统设置中配置 LLM API Key'}), 400
-    from services.llm_service import process_supplement_chat
+    from backend.services.llm_service import process_supplement_chat
     result = process_supplement_chat(name, company_summary, text, llm_row[0], llm_row[1] or '', llm_row[2] or 'gpt-4o-mini')
     updates = result.get('updates') or {}
     summary = result.get('summary') or '已记录'
@@ -2999,7 +3274,7 @@ def ask_company(current_user_id, company_id):
         return jsonify({'message': '问题不超过 500 字'}), 400
     conn = _db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_company_favorites WHERE user_id=? AND company_id=?", (current_user_id, company_id))
+    cursor.execute("SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?", (current_user_id, company_id))
     if not cursor.fetchone():
         conn.close()
         return jsonify({'message': '无权限操作该企业'}), 403
@@ -3023,7 +3298,7 @@ def ask_company(current_user_id, company_id):
     conn.close()
     if not llm_row or not (llm_row[0] and str(llm_row[0]).strip()):
         return jsonify({'message': '请先在系统设置中配置 LLM API Key'}), 400
-    from services.llm_service import ask_company_question
+    from backend.services.llm_service import ask_company_question
     result = ask_company_question(name, '\n'.join(context_parts), question, llm_row[0], llm_row[1] or '', llm_row[2] or 'gpt-4o-mini')
     return jsonify(result)
 
@@ -3033,7 +3308,7 @@ def ask_company(current_user_id, company_id):
 def get_search_interval(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT search_interval_minutes, report_template FROM user_settings WHERE user_id=?", (current_user_id,))
     row = cursor.fetchone()
@@ -3049,7 +3324,7 @@ def put_search_interval(current_user_id):
     interval = int(data.get('search_interval_minutes', 30))
     template = data.get('report_template', '')
     interval = max(10, min(1440, interval))
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM user_settings WHERE user_id=?", (current_user_id,))
     if cursor.fetchone():
@@ -3064,7 +3339,7 @@ def put_search_interval(current_user_id):
 
 def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
     """后台分析链接并归类到企业、写入资讯"""
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -3074,7 +3349,7 @@ def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
         cur.execute("SELECT id, name FROM companies")
         companies_list = [(r[0], r[1]) for r in cur.fetchall()]
         conn.close()
-        from services.llm_service import analyze_document_or_link_for_company
+        from backend.services.llm_service import analyze_document_or_link_for_company
         content = f"链接：{url}\n标题：{title}"
         result = analyze_document_or_link_for_company(title, content, companies_list, api_key, base_url, model)
         cid = result.get('company_id')
@@ -3100,7 +3375,7 @@ def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
             cur.execute("INSERT INTO company_media_reviews (company_id, platform, title, content, sentiment) VALUES (?,?,?,?,?)",
                 (cid, '用户链接', title or url[:100], result.get('summary',''), 'neutral' if float(result.get('sentiment_score',0))>=0 else 'negative'))
             if api_key:
-                from services.llm_service import analyze_sentiment_and_keywords
+                from backend.services.llm_service import analyze_sentiment_and_keywords
                 cname = cname_tag or next((c[1] for c in companies_list if c[0]==cid), '')
                 txt = (result.get('summary','') or '') + ' ' + ' '.join(result.get('keywords',[]))
                 res = analyze_sentiment_and_keywords(cname, txt, api_key, base_url, model)
@@ -3135,7 +3410,7 @@ def add_link(current_user_id):
     title = data.get('title', '')
     if not url:
         return jsonify({'message': 'URL is required'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("INSERT INTO user_links (user_id, company_id, url, title, status) VALUES (?,?,?,?,'pending')",
         (current_user_id, company_id, url, title))
@@ -3153,7 +3428,7 @@ def get_links(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
     company_id = request.args.get('company_id')
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     if company_id:
         cursor.execute("SELECT id, company_id, url, title, status, analysis_result, created_at FROM user_links WHERE user_id=? AND company_id=? ORDER BY created_at DESC",
@@ -3289,9 +3564,9 @@ def mark_alert_processed(current_user_id, alert_id):
 
 def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_id):
     """后台分析文档并归类到企业、写入资讯"""
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     try:
-        from services.document_service import extract_text_from_file
+        from backend.services.document_service import extract_text_from_file
         content = extract_text_from_file(filepath)
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -3301,7 +3576,7 @@ def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_
         cur.execute("SELECT id, name FROM companies")
         companies_list = [(r[0], r[1]) for r in cur.fetchall()]
         conn.close()
-        from services.llm_service import analyze_document_or_link_for_company
+        from backend.services.llm_service import analyze_document_or_link_for_company
         result = analyze_document_or_link_for_company(filename, content or filename, companies_list, api_key, base_url, model)
         cid = result.get('company_id')
         if cid is None and company_id:
@@ -3326,7 +3601,7 @@ def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_
             cur.execute("INSERT INTO company_media_reviews (company_id, platform, title, content, sentiment) VALUES (?,?,?,?,?)",
                 (cid, '用户文档', filename, result.get('summary','')[:500], 'neutral' if float(result.get('sentiment_score',0))>=0 else 'negative'))
             if api_key:
-                from services.llm_service import analyze_sentiment_and_keywords
+                from backend.services.llm_service import analyze_sentiment_and_keywords
                 cname = cname_tag or next((c[1] for c in companies_list if c[0]==cid), '')
                 txt = (result.get('summary','') or '') + ' ' + ' '.join(result.get('keywords',[]))
                 res = analyze_sentiment_and_keywords(cname, txt, api_key, base_url, model)
@@ -3381,13 +3656,13 @@ def upload_document(current_user_id):
 
     filename = secure_filename(file.filename)
     unique_filename = f"{uuid.uuid4()}_{filename}"
-    upload_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'uploads')
+    upload_dir = os.path.join(_DATA_DIR, 'uploads')
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, unique_filename)
     
     file.save(filepath)
     
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO documents (user_id, company_id, filename, filepath, status)
@@ -3639,7 +3914,7 @@ def batch_import_companies(current_user_id):
         industry = (item.get('industry') or '').strip()
         cursor.execute("INSERT INTO companies (name, industry, crawl_status) VALUES (?, ?, 'pending')", (name, industry))
         cid = cursor.lastrowid
-        cursor.execute("INSERT OR IGNORE INTO user_company_favorites (user_id, company_id) VALUES (?, ?)", (current_user_id, cid))
+        cursor.execute("INSERT OR IGNORE INTO user_companies (user_id, company_id) VALUES (?, ?)", (current_user_id, cid))
         created.append({'id': cid, 'name': name, 'industry': industry})
     conn.commit()
     conn.close()
@@ -3801,7 +4076,7 @@ def health_detailed():
 def get_users(current_user_id):
     if request.method == 'OPTIONS':
         return jsonify({})
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id, username, email, role, created_at FROM users ORDER BY created_at DESC")
     users = []
@@ -3836,7 +4111,7 @@ def admin_create_user(current_user_id):
         return jsonify({'message': '请填写用户名'}), 400
     if not password or len(password) < 6:
         return jsonify({'message': '密码至少 6 位'}), 400
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
@@ -3860,7 +4135,7 @@ def admin_update_user(current_user_id, user_id):
     if user_id == current_user_id:
         return jsonify({'message': '不能修改自己的角色'}), 400
     data = request.get_json() or {}
-    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM users WHERE id=?", (user_id,))
     if not cursor.fetchone():
@@ -3896,7 +4171,7 @@ def admin_delete_user(current_user_id, user_id):
         return jsonify({})
     if user_id == current_user_id:
         return jsonify({'message': '不能删除自己'}), 400
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM users WHERE id=?", (user_id,))
@@ -3933,7 +4208,7 @@ def admin_system_settings(current_user_id):
     """管理员获取或更新系统设置（如 SMTP 发件人）。GET 返回当前配置（密码脱敏），PUT/PATCH 更新。"""
     if request.method == 'OPTIONS':
         return jsonify({})
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db')
+    db_path = _DB_PATH
     if request.method in ('PUT', 'PATCH'):
         data = request.get_json() or {}
         allowed = ('smtp_host', 'smtp_port', 'smtp_user', 'smtp_from', 'smtp_password')
@@ -4029,6 +4304,115 @@ except ImportError:
             return jsonify({})
         return jsonify({'error': 'Media crawler not available'}), 500
 
+
+def _standalone_static_root():
+    """独立运行/打包时前端静态目录。打包为 .app 时 exe 在 Contents/MacOS、资源在 Contents/Frameworks。"""
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(os.path.abspath(getattr(sys, 'executable', __file__)))
+        # 若在 .app 内（.../xxx.app/Contents/MacOS），前端在 ../Frameworks/frontend
+        frameworks = os.path.normpath(os.path.join(exe_dir, '..', 'Frameworks'))
+        frontend_in_frameworks = os.path.join(frameworks, 'frontend')
+        if os.path.isdir(frontend_in_frameworks):
+            return os.path.abspath(frontend_in_frameworks)
+        return os.path.abspath(os.path.join(getattr(sys, '_MEIPASS', exe_dir), 'frontend'))
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'risk_frontend', 'build')
+
+
+_standalone_mode = os.environ.get('STANDALONE_APP', '').strip() in ('1', 'true', 'yes') or getattr(sys, 'frozen', False)
+if _standalone_mode:
+    # 让 Flask 内置的 /static/ 从打包后的前端 static 目录提供，否则会先于我们的路由返回 404
+    _frontend_root = _standalone_static_root()
+    _static_dir = os.path.join(os.path.abspath(_frontend_root), 'static')
+    if os.path.isdir(_static_dir):
+        app.static_folder = _static_dir
+        app.static_url_path = '/static'
+    _MIME_OVERRIDES = {'.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json'}
+    @app.route('/api/debug-static-root')
+    def debug_static_root():
+        """调试：返回当前静态根路径及是否存在（仅 standalone 模式）"""
+        root = _standalone_static_root()
+        return jsonify({
+            'root': root,
+            'exists': os.path.isdir(root),
+            'index_exists': os.path.isfile(os.path.join(root, 'index.html')) if root else False,
+        })
+    # 显式处理 /static/ 避免被其他逻辑误判为 404
+    @app.route('/static/<path:subpath>')
+    def serve_static(subpath):
+        from flask import Response
+        root = os.path.abspath(_standalone_static_root())
+        if not os.path.isdir(root):
+            return jsonify({'error': 'root not found', 'root': root}), 404
+        full = os.path.normpath(os.path.join(root, 'static', subpath))
+        root_real = os.path.realpath(root)
+        if not (full == root_real or full.startswith(root_real + os.sep)):
+            return jsonify({'error': 'invalid path', 'root': root, 'full': full}), 404
+        if not os.path.isfile(full):
+            return jsonify({
+                'error': 'file not found',
+                'root': root,
+                'full': full,
+                'list_dir': os.listdir(root)[:15] if os.path.isdir(root) else [],
+            }), 404
+        _, ext = os.path.splitext(subpath)
+        mimetype = _MIME_OVERRIDES.get(ext.lower(), 'application/octet-stream')
+        try:
+            with open(full, 'rb') as f:
+                return Response(f.read(), mimetype=mimetype)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    @app.route('/', defaults={'path': ''})
+    @app.route('/<path:path>')
+    def serve_frontend(path):
+        from flask import Response
+        root = os.path.abspath(_standalone_static_root())
+        if not os.path.isdir(root):
+            return 'Frontend build not found. Run: npm run build:frontend', 404
+        if path:
+            path = path.lstrip('/').replace('..', '')
+        if path:
+            full = os.path.normpath(os.path.join(root, path))
+            # 用 realpath 统一符号链接，避免 root/full 不一致导致 startswith 失败
+            root_real = os.path.realpath(root)
+            full_real = os.path.realpath(full) if os.path.exists(full) else full
+            if not full_real.startswith(root_real):
+                return 'Invalid path', 404
+            if os.path.isfile(full):
+                _, ext = os.path.splitext(path)
+                mimetype = _MIME_OVERRIDES.get(ext.lower(), 'application/octet-stream')
+                try:
+                    with open(full, 'rb') as f:
+                        return Response(f.read(), mimetype=mimetype)
+                except Exception as e:
+                    logger.exception('serve_frontend read error')
+                    return jsonify({'error': str(e)}), 500
+            # 文件不存在时返回调试信息（仅 /static/ 且 frozen）
+            if path.startswith('static/') and getattr(sys, 'frozen', False):
+                try:
+                    ls = os.listdir(root)
+                    static_ls = os.listdir(os.path.join(root, 'static')) if os.path.isdir(os.path.join(root, 'static')) else []
+                except Exception:
+                    ls = static_ls = []
+                return jsonify({
+                    'debug': 'file not found',
+                    'root': root,
+                    'path': path,
+                    'full': full,
+                    'root_exists': os.path.isdir(root),
+                    'list_root': ls[:20],
+                    'list_static': static_ls[:20],
+                }), 404
+        index_path = os.path.join(root, 'index.html')
+        if os.path.isfile(index_path):
+            try:
+                with open(index_path, 'rb') as f:
+                    return Response(f.read(), mimetype='text/html; charset=utf-8')
+            except Exception as e:
+                logger.exception('serve_frontend index error')
+                return jsonify({'error': str(e)}), 500
+        return 'Frontend index.html not found', 404
+
+
 if __name__ == '__main__':
     _secret = app.config.get('SECRET_KEY') or ''
     if _secret == 'your-secret-key-change-in-production' or (isinstance(_secret, str) and len(_secret) < 20):
@@ -4036,6 +4420,11 @@ if __name__ == '__main__':
             'SECRET_KEY 仍为默认或过短，生产环境请设置强随机密钥。'
             '可运行: python backend/scripts/generate_secret_key.py'
         )
+    run_standalone_server()
+
+
+def run_standalone_server():
+    """独立运行时的服务入口（init_db、定时任务、Flask）。供桌面窗口启动器在子线程中调用。"""
     if not os.environ.get('SKIP_DROP_TABLES') and os.environ.get('FLASK_ENV') != 'production':
         logger.warning(
             '未设置 SKIP_DROP_TABLES=1 或 FLASK_ENV=production，'
@@ -4043,8 +4432,8 @@ if __name__ == '__main__':
         )
     init_db()
     try:
-        from services.scheduler_service import start_scheduler
-        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'risk_platform.db'))
+        from backend.services.scheduler_service import start_scheduler
+        conn = sqlite3.connect(_DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT search_interval_minutes FROM user_settings WHERE search_interval_minutes > 0 LIMIT 1")
         row = cur.fetchone()
@@ -4055,4 +4444,12 @@ if __name__ == '__main__':
     except Exception as e:
         logger.warning('Scheduler start error: %s', e)
     debug = not _is_production
-    app.run(debug=debug, port=int(os.environ.get('PORT', 8005)), host=os.environ.get('HOST', '0.0.0.0'))
+    port = int(os.environ.get('PORT', 8005))
+    host = os.environ.get('HOST') or ('127.0.0.1' if _standalone_mode else '0.0.0.0')
+    if _standalone_mode and not os.environ.get('DESKTOP_WINDOW', '').strip() in ('1', 'true', 'yes'):
+        def _open_browser():
+            time.sleep(1.5)
+            import webbrowser
+            webbrowser.open(f'http://127.0.0.1:{port}/')
+        threading.Thread(target=_open_browser, daemon=True).start()
+    app.run(debug=debug, port=port, host=host, use_reloader=False)

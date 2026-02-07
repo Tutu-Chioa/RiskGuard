@@ -14,3 +14,8 @@ jieba>=0.42.1
 pypdf>=3.0.0
 openpyxl>=3.1.0
 reportlab>=4.0.0
+
+# 桌面窗口模式（可选，仅 macOS）：不依赖浏览器，以独立应用窗口运行
+# pip install pywebview；若需再装: pyobjc-framework-WebKit
+# pywebview>=4.0
+# Pillow 由 qrcode[pil] 间接依赖，无需单独列出

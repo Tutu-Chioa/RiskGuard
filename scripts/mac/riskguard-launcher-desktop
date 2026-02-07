@@ -1,0 +1,11 @@
+#!/bin/bash
+# RiskGuard Mac .app 桌面窗口模式：用 pywebview 在应用内窗口打开，不启动系统浏览器
+set -e
+RESOURCES="$(dirname "$0")/../Resources"
+cd "$RESOURCES"
+export STANDALONE_APP=1
+export DESKTOP_WINDOW=1
+export FLASK_ENV=production
+export SKIP_DROP_TABLES=1
+# 需已安装: pip install pywebview (macOS 建议再装 pyobjc-framework-WebKit)
+exec python3 backend/run_desktop.py

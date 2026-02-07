@@ -1,0 +1,10 @@
+#!/bin/bash
+# RiskGuard Mac .app 启动脚本：在 Resources 目录下以独立模式运行 Flask，并自动打开浏览器
+set -e
+RESOURCES="$(dirname "$0")/../Resources"
+cd "$RESOURCES"
+export STANDALONE_APP=1
+export FLASK_ENV=production
+export SKIP_DROP_TABLES=1
+# 使用系统 Python3 运行后端（需已安装 Python 3 及依赖）
+exec python3 backend/app.py

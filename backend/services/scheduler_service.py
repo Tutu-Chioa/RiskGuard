@@ -22,9 +22,9 @@ def get_db_path():
 def refresh_all_companies():
     """刷新所有企业的工商/舆情/新闻信息"""
     try:
-        from services.enterprise_crawler import fetch_company_info, fetch_news_for_company
-        from services.llm_service import analyze_sentiment_and_keywords, analyze_news_for_company
-        from services.wordcloud_service import generate_wordcloud
+        from backend.services.enterprise_crawler import fetch_company_info, fetch_news_for_company
+        from backend.services.llm_service import analyze_sentiment_and_keywords, analyze_news_for_company
+        from backend.services.wordcloud_service import generate_wordcloud
 
         conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
@@ -37,7 +37,7 @@ def refresh_all_companies():
         if llm_row:
             api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
             enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
-        from services.llm_service import fetch_company_info_by_llm
+        from backend.services.llm_service import fetch_company_info_by_llm
 
         for cid, cname in companies:
             try:
@@ -104,8 +104,8 @@ def refresh_all_companies():
 
                 # 定时媒体舆情爬取：基于关键词搜索，入库时按 (company_id, platform, title) 去重，只插入新条目
                 try:
-                    from services.crawler import trigger_media_crawl
-                    from services.media_review_store import save_media_reviews_dedup
+                    from backend.services.crawler import trigger_media_crawl
+                    from backend.services.media_review_store import save_media_reviews_dedup
                     def _save_reviews(cid2, reviews):
                         save_media_reviews_dedup(DB_PATH, cid2, cname, reviews, api_key, base_url, model)
                     trigger_media_crawl(cid, cname, callback=_save_reviews)
@@ -134,7 +134,7 @@ def refresh_macro_policy_digest():
             return False, '未配置 LLM API，无法生成宏观政策摘要'
         api_key, base_url, model = row[0], row[1], row[2]
         enable_web_search = bool(row[3]) if len(row) > 3 else True
-        from services.llm_service import generate_macro_policy_digest
+        from backend.services.llm_service import generate_macro_policy_digest
         result = generate_macro_policy_digest(
             api_key=api_key, base_url=base_url, model=model, enable_web_search=enable_web_search
         )
@@ -169,7 +169,7 @@ def refresh_macro_policy_news():
             return
         api_key, base_url, model = row[0], row[1], row[2]
         enable_web_search = bool(row[3]) if len(row) > 3 else True
-        from services.llm_service import generate_macro_policy_news_items
+        from backend.services.llm_service import generate_macro_policy_news_items
         items = generate_macro_policy_news_items(
             api_key=api_key, base_url=base_url, model=model, enable_web_search=enable_web_search
         )

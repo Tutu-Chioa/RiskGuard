@@ -24,7 +24,7 @@ def save_media_reviews_dedup(db_path, company_id, company_name, reviews, api_key
     reviews_text = (' '.join((r.get('content') or '') for r in reviews)).strip()
     # 仅当有实质评论内容时才调用 LLM 并更新社会评价，避免把「缺乏评论、中性」写入库
     if api_key and reviews and len(reviews_text) >= 10:
-        from services.llm_service import analyze_sentiment_and_keywords
+        from backend.services.llm_service import analyze_sentiment_and_keywords
         result = analyze_sentiment_and_keywords(company_name, reviews_text, api_key, base_url, model)
         summary = (result.get('summary') or '').strip()
         # 若 LLM 返回的是「缺乏内容」类结论，不覆盖原有社会评价
