@@ -10,7 +10,7 @@
 
 ## 简介
 
-RiskGuard 支持添加关注企业、爬取工商与舆情数据、大模型分析风险与社会评价、仪表盘与风险警报。支持多用户、权限隔离、管理员后台、两步验证与自动备份，适合内网或云服务器部署。**macOS 用户**可打包为独立 .app / .dmg，双击运行、无需浏览器与 Python 环境。
+RiskGuard 支持添加关注企业、爬取工商与舆情数据、大模型分析风险与社会评价、风险时间序列与预测、仪表盘与风险警报。提供系统说明页与数据表管理（DbViewer），便于理解计算逻辑与维护数据。支持多用户、权限隔离、管理员后台、两步验证与自动备份，适合内网或云服务器部署。**macOS 用户**可打包为独立 .app / .dmg，双击运行、无需浏览器与 Python 环境。
 
 ## 主要功能
 
@@ -18,8 +18,10 @@ RiskGuard 支持添加关注企业、爬取工商与舆情数据、大模型分�
 |------|------|
 | **企业管理** | 添加/编辑企业，工商信息与舆情爬取（可接爱企查/企查查、MediaCrawler） |
 | **风险分析** | LLM 分析新闻与媒体评价，风险等级、词云、趋势图表 |
+| **风险预测** | 基于企业风险时间序列的线性趋势 + 宏观指数调整，未来 N 天点预测与约 95% 区间；支持回测（MAE、RMSE、方向准确率、残差标准差） |
 | **仪表盘** | 风险分布、趋势、分类统计 |
 | **企业对比** | 多企业并排对比 |
+| **系统说明与数据管理** | 系统说明页（数据流、计算依据、关键表）；DbViewer 查看/编辑核心数据表（需管理员） |
 | **多用户与权限** | 注册/登录、JWT、按用户隔离数据、管理员用户管理 |
 | **安全** | 两步验证（TOTP）、自动备份、限流、忘记密码（需配置 SMTP） |
 | **响应式** | 支持桌面、平板与手机 |
@@ -89,9 +91,23 @@ python backend/run_desktop.py
 |------|------|
 | [STARTUP.md](STARTUP.md) | 本地/服务器完整启动流程 |
 | [docs/PACKAGE_MAC_DMG.md](docs/PACKAGE_MAC_DMG.md) | Mac 打包 .app / .dmg、桌面窗口模式 |
+| [docs/PREDICTION_METHODOLOGY.md](docs/PREDICTION_METHODOLOGY.md) | 风险预测方法（假设、公式、回测、配置与局限） |
+| [docs/计算过程与底层逻辑.md](docs/计算过程与底层逻辑.md) | 从原始数据到风险分与预测的整体计算流程与公式 |
+| [docs/DB_BROWSER_使用说明.md](docs/DB_BROWSER_使用说明.md) | 用 DB Browser for SQLite 查看/维护数据库 |
 | [docs/WHO_DOES_WHAT.md](docs/WHO_DOES_WHAT.md) | 配置项说明 |
 | [docs/DEPLOY_FROM_GITHUB.md](docs/DEPLOY_FROM_GITHUB.md) | 从 GitHub 部署到云服务器 |
 | [backend/CRAWLER_SETUP.md](backend/CRAWLER_SETUP.md) | 爬虫与 LLM 配置 |
+
+## 推送时遇到 SSL 错误
+
+若 `git push` 出现 `SSL_ERROR_SYSCALL` 或连接 GitHub 超时，可改用 **SSH** 推送（需已配置 SSH 密钥）：
+
+```bash
+git remote set-url origin git@github.com:Tutu-Chioa/RiskGuard.git
+git push origin main
+```
+
+或检查网络/代理、防火墙是否拦截 443 端口。
 
 ## 许可证
 
