@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceArea,
+} from 'recharts';
 import { useToast } from './ToastContext';
 import { useDateTimeFormat } from './utils/useDateTimeFormat';
 
@@ -32,6 +35,9 @@ const CompanyDetail = () => {
   const [askQuestion, setAskQuestion] = useState('');
   const [askAnswer, setAskAnswer] = useState('');
   const [askLoading, setAskLoading] = useState(false);
+  const [riskTimeseries, setRiskTimeseries] = useState([]);
+  const [riskPredict, setRiskPredict] = useState(null);
+  const [riskLoading, setRiskLoading] = useState(false);
 
   const fetchCompanyNews = useCallback(async () => {
     const currentId = id;
@@ -65,6 +71,8 @@ const CompanyDetail = () => {
       if (res.ok) {
         await fetchCompanyNews();
         await fetchCompanyDetails(false);
+        await fetchRiskTimeseries();
+        await fetchRiskPredict();
         toast.success(data.message || '搜索完成');
       } else {
         toast.error(data.message || '搜索失败');
@@ -163,6 +171,54 @@ const CompanyDetail = () => {
     if (id) fetchSupplements();
   }, [id, fetchSupplements]);
 
+  const fetchRiskTimeseries = useCallback(async () => {
+    if (!id) return;
+    const token = localStorage.getItem('token');
+    try {
+      const res = await fetch(`/api/companies/${id}/risk-timeseries?days=90`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setRiskTimeseries(Array.isArray(data) ? data : []);
+      } else {
+        setRiskTimeseries([]);
+      }
+    } catch (e) {
+      console.error('risk-timeseries', e);
+      setRiskTimeseries([]);
+    }
+  }, [id]);
+
+  const fetchRiskPredict = useCallback(async () => {
+    if (!id) return;
+    const token = localStorage.getItem('token');
+    try {
+      const res = await fetch('/api/v1/predict/risk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ enterprise_id: parseInt(id, 10), horizon_days: 30 }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setRiskPredict(data);
+      } else {
+        setRiskPredict(null);
+      }
+    } catch (e) {
+      console.error('predict/risk', e);
+      setRiskPredict(null);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    setRiskTimeseries([]);
+    setRiskPredict(null);
+    setRiskLoading(true);
+    Promise.all([fetchRiskTimeseries(), fetchRiskPredict()]).finally(() => setRiskLoading(false));
+  }, [id, fetchRiskTimeseries, fetchRiskPredict]);
+
   const handleSupplementSubmit = async (e) => {
     e.preventDefault();
     const text = supplementText.trim();
@@ -224,13 +280,17 @@ const CompanyDetail = () => {
       const err = llm === 'error' || news === 'error' || media === 'error';
       if (done && !err) toast.success('自动化流程已更新');
       else if (err) toast.error('部分任务异常，请检查配置后重试');
-      if (news === 'success') fetchCompanyNews();
+      if (news === 'success') {
+        fetchCompanyNews();
+        fetchRiskTimeseries();
+        fetchRiskPredict();
+      }
     }
     if (isRunning) wasRunning.current = true;
     if (!isRunning) return;
     const t = setInterval(() => fetchCompanyDetails(false), 3000);
     return () => clearInterval(t);
-  }, [company?.llm_status, company?.news_status, company?.media_status, fetchCompanyDetails, fetchCompanyNews, toast]);
+  }, [company?.llm_status, company?.news_status, company?.media_status, fetchCompanyDetails, fetchCompanyNews, fetchRiskTimeseries, fetchRiskPredict, toast]);
 
   const handleCrawl = async () => {
     setCrawling(true);
@@ -585,6 +645,105 @@ const CompanyDetail = () => {
             </div>
           </div>
           <p className="text-xs text-gray-400 mt-3">数据来自工商信息、大模型相关新闻与社会评价爬取，便于快速把握企业风险与信息完整度</p>
+        </div>
+      )}
+
+      {/* 风险趋势与预测：两图对齐，标题行 + 图表行 + 说明行 */}
+      {company && String(company.id) === String(id) && (
+        <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100">
+          <h2 className="text-xl font-bold text-gray-800 mb-4">风险趋势与预测</h2>
+          {riskLoading ? (
+            <p className="text-gray-500 py-8 text-center">加载趋势与预测中…</p>
+          ) : (
+            <div className="space-y-3">
+              {/* 标题行：两列对齐 */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-6">
+                <h3 className="text-sm font-semibold text-gray-700">近期风险得分趋势（0–100）</h3>
+                <h3 className="text-sm font-semibold text-gray-700">风险预测（未来 30 天）</h3>
+              </div>
+              {/* 图表行：两图同高、对齐 */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-6 gap-y-4">
+                <div className="min-h-[16rem] h-64 flex flex-col">
+                  {riskTimeseries.length > 0 ? (
+                    <div className="flex-1 min-h-0">
+                      <ResponsiveContainer width="100%" height="100%" minHeight={200}>
+                        <LineChart data={riskTimeseries} margin={{ top: 8, right: 16, left: 0, bottom: 24 }}>
+                          <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200" />
+                          <XAxis dataKey="date" tick={{ fontSize: 11 }} tickFormatter={(v) => (v && v.length >= 10 ? v.slice(5, 10) : v)} />
+                          <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} />
+                          <Tooltip
+                            formatter={(val) => [Number(val).toFixed(1), '风险分']}
+                            labelFormatter={(label) => label || ''}
+                            contentStyle={{ fontSize: 12 }}
+                          />
+                          <Line type="monotone" dataKey="risk_score" name="综合风险分" stroke="#6366f1" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className="h-64 flex items-center justify-center rounded border border-gray-100 bg-gray-50/50">
+                      <p className="text-gray-500 text-sm text-center px-4">暂无时间序列数据，请先执行「大模型搜索相关新闻」并等待自动入库后刷新</p>
+                    </div>
+                  )}
+                </div>
+                <div className="min-h-[16rem] h-64 flex flex-col">
+                  {riskPredict && !riskPredict.message && riskPredict.predictions && riskPredict.predictions.length > 0 ? (
+                    <div className="flex-1 min-h-0">
+                      <ResponsiveContainer width="100%" height="100%" minHeight={200}>
+                        <LineChart
+                          data={riskPredict.predictions.map((p) => ({
+                            ...p,
+                            low: p.confidence_interval?.[0],
+                            high: p.confidence_interval?.[1],
+                          }))}
+                          margin={{ top: 8, right: 16, left: 0, bottom: 24 }}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200" />
+                          <XAxis dataKey="date" tick={{ fontSize: 11 }} tickFormatter={(v) => (v && v.length >= 10 ? v.slice(5, 10) : v)} />
+                          <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} />
+                          <Tooltip
+                            formatter={(val) => [Number(val).toFixed(1), '预测分']}
+                            labelFormatter={(label) => label || ''}
+                            contentStyle={{ fontSize: 12 }}
+                          />
+                          {riskPredict.predictions[0]?.confidence_interval && (
+                            <ReferenceArea y1="low" y2="high" fill="#f59e0b" fillOpacity={0.15} />
+                          )}
+                          <Line type="monotone" dataKey="risk_score" name="预测风险分" stroke="#f59e0b" strokeWidth={2} strokeDasharray="4 2" dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className="h-64 flex items-center justify-center rounded border border-gray-100 bg-gray-50/50">
+                      <p className="text-gray-500 text-sm text-center px-4">
+                        {riskPredict?.message === 'no_timeseries_data' ? '暂无时间序列数据，无法预测' : '暂无预测结果'}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+              {/* 说明行：趋势描述、宏观说明、回测/ML 等放在图表下方，右侧列 */}
+              {riskPredict && !riskPredict.message && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-6">
+                  <div />
+                  <div className="space-y-1">
+                    {riskPredict.trend_description && (
+                      <p className="text-gray-700 text-sm">{riskPredict.trend_description}</p>
+                    )}
+                    {riskPredict.macro_note && (
+                      <p className="text-xs text-gray-500 border-l-2 border-gray-200 pl-2">{riskPredict.macro_note}</p>
+                    )}
+                    {riskPredict.confidence_interval_based_on_backtest && (
+                      <p className="text-xs text-gray-500">预测区间（约 95%）基于历史回测残差</p>
+                    )}
+                    {riskPredict.ml_risk_probability != null && (
+                      <p className="text-xs text-gray-500">ML 高风险概率：{(Number(riskPredict.ml_risk_probability) * 100).toFixed(1)}%</p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 

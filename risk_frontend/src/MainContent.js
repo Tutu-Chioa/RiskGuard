@@ -95,6 +95,8 @@ const MainContent = ({ user }) => {
   const [dashboardLoading, setDashboardLoading] = useState(true);
   const [alertSeverityFilter, setAlertSeverityFilter] = useState('');
   const [markingAlertId, setMarkingAlertId] = useState(null);
+  const [multiRisk, setMultiRisk] = useState({});
+  const [multiRiskLoading, setMultiRiskLoading] = useState(false);
 
   // 根据当前路径设置选中的标签
   useEffect(() => {
@@ -161,6 +163,64 @@ const MainContent = ({ user }) => {
       loadData();
     }
   }, [location.pathname, loadData]);
+
+  // 首页多企业风险趋势与预测：加载若干家风险较高的企业的时间序列 + 预测结果
+  const loadMultiRisk = React.useCallback(async () => {
+    const token = localStorage.getItem('token');
+    if (!token || !companies || companies.length === 0) return;
+    const headers = { Authorization: `Bearer ${token}` };
+    const headersJson = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+    // 按风险等级排序，高→中→低→未知，仅取前 4 家，减少请求量
+    const score = { '高': 3, '中': 2, '低': 1, '未知': 0 };
+    const selected = [...companies]
+      .sort((a, b) => (score[b.risk_level || '未知'] - score[a.risk_level || '未知']))
+      .slice(0, 4);
+    if (!selected.length) return;
+    setMultiRiskLoading(true);
+    try {
+      const results = await Promise.all(selected.map(async (c) => {
+        const id = c.id;
+        try {
+          const [tsRes, predRes] = await Promise.all([
+            fetch(`/api/companies/${id}/risk-timeseries?days=60`, { headers }),
+            fetch('/api/v1/predict/risk', {
+              method: 'POST',
+              headers: headersJson,
+              body: JSON.stringify({ enterprise_id: id, horizon_days: 30 }),
+            }),
+          ]);
+          let timeseries = [];
+          let predict = null;
+          if (tsRes.ok) {
+            const d = await tsRes.json();
+            timeseries = Array.isArray(d) ? d : [];
+          }
+          if (predRes.ok) {
+            predict = await predRes.json();
+          }
+          return { id, timeseries, predict };
+        } catch (e) {
+          console.error('loadMultiRisk company error', c.id, e);
+          return { id: c.id, timeseries: [], predict: null };
+        }
+      }));
+      const next = {};
+      results.forEach((r) => {
+        if (r && r.id != null) {
+          next[r.id] = { timeseries: r.timeseries || [], predict: r.predict || null };
+        }
+      });
+      setMultiRisk(next);
+    } finally {
+      setMultiRiskLoading(false);
+    }
+  }, [companies]);
+
+  useEffect(() => {
+    if (!dashboardLoading && companies && companies.length) {
+      loadMultiRisk();
+    }
+  }, [dashboardLoading, companies, loadMultiRisk]);
 
   const levelValue = { '低': 25, '中': 55, '高': 85 };
   const icons = ['📊', '⚖️', '📰', '⚠️'];
@@ -241,6 +301,14 @@ const MainContent = ({ user }) => {
     owner: c.industry || '-',
     tag: c.risk_level || '未知'
   })) : [];
+
+  // 首页多企业风险卡片：默认展示风险等级较高的前 4 家
+  const riskLevelScore = { '高': 3, '中': 2, '低': 1, '未知': 0 };
+  const topRiskCompanies = companies.length
+    ? [...companies]
+        .sort((a, b) => (riskLevelScore[b.risk_level || '未知'] - riskLevelScore[a.risk_level || '未知']))
+        .slice(0, 4)
+    : [];
 
   const handleViewCompany = (companyId) => {
     navigate(`/company/${companyId}`);
@@ -461,6 +529,171 @@ const MainContent = ({ user }) => {
               </>
               )}
             </div>
+          </div>
+
+          {/* 多企业风险趋势与预测总览：在首页一次性对比若干企业的趋势与预测 */}
+          <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700">
+            <div className="flex items-center justify-between mb-2 gap-2">
+              <div>
+                <h3 className="text-lg font-bold text-gray-800 dark:text-gray-100">多企业风险趋势与预测</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  默认展示最近风险等级较高的 4 家企业，便于在首页快速对比风险走势与预测结果
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={loadMultiRisk}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-600"
+              >
+                刷新趋势
+              </button>
+            </div>
+            {multiRiskLoading && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                {[1, 2, 3, 4].map((i) => (
+                  <div key={i} className="border border-dashed border-gray-200 dark:border-gray-700 rounded-lg p-4 animate-pulse">
+                    <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-32 mb-3" />
+                    <div className="h-24 bg-gray-100 dark:bg-gray-800 rounded mb-2" />
+                    <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-40" />
+                  </div>
+                ))}
+              </div>
+            )}
+            {!multiRiskLoading && topRiskCompanies.length === 0 && (
+              <p className="text-gray-500 dark:text-gray-400 py-6 text-center text-sm">
+                暂无企业风险时间序列数据，请先添加企业并完成「相关新闻」与「社会评价」采集。
+              </p>
+            )}
+            {!multiRiskLoading && topRiskCompanies.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                {topRiskCompanies.map((c) => {
+                  const m = multiRisk[c.id] || {};
+                  const ts = m.timeseries || [];
+                  const pred = m.predict;
+                  const cardTitle = c.name || `企业 #${c.id}`;
+                  const riskTag = c.risk_level || '未知';
+                  const smallTs = ts.slice(-30);
+                  const smallPred = (pred && pred.predictions && Array.isArray(pred.predictions))
+                    ? pred.predictions.slice(0, 15)
+                    : [];
+                  return (
+                    <div
+                      key={c.id}
+                      className="border border-gray-100 dark:border-gray-700 rounded-lg p-4 hover:shadow-sm transition cursor-pointer"
+                      onClick={() => handleViewCompany(c.id)}
+                    >
+                      <div className="flex items-center justify-between mb-2 gap-2">
+                        <div className="truncate">
+                          <div className="text-sm font-semibold text-gray-800 dark:text-gray-100 truncate">{cardTitle}</div>
+                          <div className="text-xs text-gray-500 dark:text-gray-400">
+                            最近更新：{c.last_updated ? formatDate(c.last_updated) : '-'}
+                          </div>
+                        </div>
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                            riskTag === '高'
+                              ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
+                              : riskTag === '中'
+                              ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'
+                              : riskTag === '低'
+                              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                              : 'bg-slate-100 text-slate-700 dark:bg-slate-800/60 dark:text-slate-200'
+                          }`}
+                        >
+                          风险：{riskTag}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">近期趋势</p>
+                          {smallTs.length > 0 ? (
+                            <div className="h-24">
+                              <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={smallTs} margin={{ top: 4, right: 8, left: 0, bottom: 8 }}>
+                                  <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200 dark:stroke-gray-700" />
+                                  <XAxis
+                                    dataKey="date"
+                                    tick={{ fontSize: 9 }}
+                                    tickFormatter={(v) => (v && v.length >= 10 ? v.slice(5, 10) : v)}
+                                  />
+                                  <YAxis domain={[0, 100]} tick={{ fontSize: 9 }} />
+                                  <Tooltip
+                                    formatter={(val) => [Number(val).toFixed(1), '风险分']}
+                                    labelFormatter={(label) => label || ''}
+                                    contentStyle={chartTooltipStyle}
+                                  />
+                                  <Line
+                                    type="monotone"
+                                    dataKey="risk_score"
+                                    name="风险分"
+                                    stroke="#6366f1"
+                                    strokeWidth={2}
+                                    dot={false}
+                                    isAnimationActive={false}
+                                  />
+                                </LineChart>
+                              </ResponsiveContainer>
+                            </div>
+                          ) : (
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-4">暂无时间序列数据</p>
+                          )}
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">预测（未来 30 天）</p>
+                          {smallPred.length > 0 ? (
+                            <div className="h-24">
+                              <ResponsiveContainer width="100%" height="100%">
+                                <LineChart
+                                  data={smallPred.map((p) => ({
+                                    ...p,
+                                    low: p.confidence_interval?.[0],
+                                    high: p.confidence_interval?.[1],
+                                  }))}
+                                  margin={{ top: 4, right: 8, left: 0, bottom: 8 }}
+                                >
+                                  <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200 dark:stroke-gray-700" />
+                                  <XAxis
+                                    dataKey="date"
+                                    tick={{ fontSize: 9 }}
+                                    tickFormatter={(v) => (v && v.length >= 10 ? v.slice(5, 10) : v)}
+                                  />
+                                  <YAxis domain={[0, 100]} tick={{ fontSize: 9 }} />
+                                  <Tooltip
+                                    formatter={(val) => [Number(val).toFixed(1), '预测分']}
+                                    labelFormatter={(label) => label || ''}
+                                    contentStyle={chartTooltipStyle}
+                                  />
+                                  <Line
+                                    type="monotone"
+                                    dataKey="risk_score"
+                                    name="预测风险分"
+                                    stroke="#f59e0b"
+                                    strokeWidth={2}
+                                    dot={false}
+                                    isAnimationActive={false}
+                                  />
+                                </LineChart>
+                              </ResponsiveContainer>
+                            </div>
+                          ) : (
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-4">
+                              {pred && pred.message === 'no_timeseries_data'
+                                ? '暂无时间序列数据，无法预测'
+                                : '暂无预测结果'}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      {pred && !pred.message && pred.trend_description && (
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-2 line-clamp-2">
+                          {pred.trend_description}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* 风险指标总览（基于近 N 天企业相关新闻分类与风险等级聚合） */}

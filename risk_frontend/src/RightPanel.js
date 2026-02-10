@@ -170,7 +170,7 @@ const RightPanel = () => {
 
   useEffect(() => {
     fetchPolicyNews();
-    const t = setInterval(fetchPolicyNews, 30 * 60 * 1000);
+    const t = setInterval(fetchPolicyNews, 10 * 60 * 1000); // 每 10 分钟自动更新
     return () => clearInterval(t);
   }, []);
 
@@ -514,8 +514,8 @@ const RightPanel = () => {
               </div>
             ) : (
               <>
-                <div className="space-y-3 max-h-72 overflow-y-auto">
-                  {policyNews.slice(0, 5).map((item) => (
+                <div className="space-y-3 max-h-80 overflow-y-auto">
+                  {policyNews.slice(0, 8).map((item) => (
                     <div 
                       key={item.id}
                       className="rounded-lg border border-gray-200 dark:border-gray-600 p-3 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer transition-colors"

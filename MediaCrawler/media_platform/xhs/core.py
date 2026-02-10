@@ -96,16 +96,26 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
-            if not await self.xhs_client.pong():
-                login_obj = XiaoHongShuLogin(
-                    login_type=config.LOGIN_TYPE,
-                    login_phone="",  # input your phone number
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    cookie_str=config.COOKIES,
-                )
-                await login_obj.begin()
+            need_login = not await self.xhs_client.pong()
+            # 当由本系统（sys2）传入 MEDIACRAWLER_USE_PLAYWRIGHT=1 时，表示复用已登录的 browser_data，避免再次弹二维码
+            if need_login and os.environ.get("MEDIACRAWLER_USE_PLAYWRIGHT") == "1":
+                await asyncio.sleep(2)
                 await self.xhs_client.update_cookies(browser_context=self.browser_context)
+                need_login = not await self.xhs_client.pong()
+            if need_login:
+                # 仍失败且非「复用会话」模式时才执行扫码登录，否则信任已有会话、不再弹二维码
+                if os.environ.get("MEDIACRAWLER_USE_PLAYWRIGHT") != "1":
+                    login_obj = XiaoHongShuLogin(
+                        login_type=config.LOGIN_TYPE,
+                        login_phone="",  # input your phone number
+                        browser_context=self.browser_context,
+                        context_page=self.context_page,
+                        cookie_str=config.COOKIES,
+                    )
+                    await login_obj.begin()
+                    await self.xhs_client.update_cookies(browser_context=self.browser_context)
+                else:
+                    utils.logger.info("[XiaoHongShuCrawler] MEDIACRAWLER_USE_PLAYWRIGHT=1: reusing session, skip QR login even if pong failed")
 
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":

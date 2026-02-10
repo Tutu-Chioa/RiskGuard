@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # 从 backend/.env 加载环境变量（MEDIACRAWLER_PATH、SECRET_KEY、SMTP 等），无需每次手动 export
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_backend_dir)
+# 开发/非打包时：确保项目根在 path 最前，否则 from backend.services.xxx 会报 No module named 'backend'
+if not getattr(sys, 'frozen', False) and _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 # .app 下再次确保含 backend 的目录在 path 最前（run_desktop 已设，此处兜底，避免 no module named 'services'）
 if getattr(sys, 'frozen', False):
     _exe_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -707,6 +710,96 @@ def init_db():
             dimension TEXT,
             published_at TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # 宏观指数：按日汇总，由 macro_policy_news 计算得到，供风险预测等使用
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS macro_daily_index (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_date TEXT NOT NULL UNIQUE,
+            policy_score REAL NOT NULL DEFAULT 0,
+            macro_risk_score REAL NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # 企业事件特征表：新闻 / 舆情 / 政策 / 工商变更 等结构化事件，供风险聚合与预测使用
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS enterprise_event_feature (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            enterprise_id INTEGER NOT NULL,
+            source_type TEXT NOT NULL,          -- NEWS / SOCIAL / POLICY / BIZ_REG
+            source_id INTEGER,                  -- 对应原始记录主键（如 company_news.id）
+            event_date TEXT NOT NULL,           -- 事件日期（YYYY-MM-DD）
+            event_type TEXT NOT NULL,           -- LEGAL_PENALTY / LITIGATION / FINANCIAL_STRESS / MANAGEMENT_CHANGE / PUBLIC_OPINION / OTHER ...
+            sentiment_label TEXT,               -- NEG / NEU / POS
+            sentiment_score REAL,               -- -1 ~ 1
+            severity_score REAL,                -- 0 ~ 1
+            policy_direction TEXT,              -- POSITIVE / NEUTRAL / NEGATIVE（仅 POLICY）
+            policy_strength REAL,               -- 0 ~ 1（仅 POLICY）
+            biz_change_type TEXT,               -- 高管变更 / 注册资本变更 等（仅 BIZ_REG）
+            extra_json TEXT,                    -- 其他 LLM 抽取字段（JSON）
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (enterprise_id) REFERENCES companies (id)
+        )
+    ''')
+    # 企业风险时间序列表：按日聚合各维度风险得分与辅助特征
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS enterprise_risk_timeseries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            enterprise_id INTEGER NOT NULL,
+            ts_date TEXT NOT NULL,              -- 日期（YYYY-MM-DD）
+            score_legal REAL NOT NULL,          -- 0~1 法律与合规风险
+            score_business REAL NOT NULL,       -- 0~1 经营与财务风险
+            score_media REAL NOT NULL,          -- 0~1 舆情与媒体风险
+            score_policy REAL NOT NULL,         -- 0~1 政策与监管风险
+            score_industry REAL NOT NULL,       -- 0~1 行业与宏观风险
+            risk_score REAL NOT NULL,           -- 0~100 综合风险得分
+            news_count INTEGER NOT NULL DEFAULT 0,
+            neg_news_ratio REAL NOT NULL DEFAULT 0,
+            sentiment_index REAL,               -- 当日情绪指数（平均 sentiment_score）
+            sentiment_vol REAL,                 -- 过去 N 日情绪波动率
+            policy_impact REAL,                 -- 政策负面影响指数
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(enterprise_id, ts_date),
+            FOREIGN KEY (enterprise_id) REFERENCES companies (id)
+        )
+    ''')
+    # 预测回测指标：MAE、残差标准差等，供预测区间与准确性评估
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS backtest_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric_name TEXT NOT NULL UNIQUE,
+            value_real REAL,
+            value_text TEXT,
+            extra_json TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # 预测与宏观参数：可配置权重与中性值，便于客观调参
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS prediction_config (
+            key TEXT NOT NULL PRIMARY KEY,
+            value_text TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    for cfg_key, cfg_val in [('macro_adjustment_scale', '20'), ('macro_neutral', '0.5'), ('prediction_interval_z', '1.96')]:
+        try:
+            cursor.execute("INSERT OR IGNORE INTO prediction_config (key, value_text, updated_at) VALUES (?, ?, ?)", (cfg_key, cfg_val, datetime.now().isoformat()))
+        except sqlite3.OperationalError:
+            pass
+    # 企业风险标签：用于训练 ML 模型（如爆雷/高风险事件标签）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS enterprise_risk_label (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            enterprise_id INTEGER NOT NULL,
+            as_of_date TEXT NOT NULL,           -- 标签对应的观察起点日（YYYY-MM-DD）
+            label_type TEXT NOT NULL,           -- explosion / default / penalty 等
+            label_value INTEGER NOT NULL,       -- 0/1
+            note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(enterprise_id, as_of_date, label_type),
+            FOREIGN KEY (enterprise_id) REFERENCES companies (id)
         )
     ''')
     # company_news 多维度风险
@@ -1548,6 +1641,23 @@ def get_macro_policy_news(current_user_id):
     return jsonify(items)
 
 
+@app.route('/api/macro-index/refresh', methods=['POST', 'OPTIONS'])
+@token_required
+def refresh_macro_index_api(current_user_id):
+    """根据当前 macro_policy_news 重新计算宏观指数并写入 macro_daily_index（供预测使用）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    try:
+        from backend.services import macro_index_service as mis
+        mis.DB_PATH = _DB_PATH
+        if mis.compute_and_save_macro_index(_DB_PATH):
+            return jsonify({'success': True, 'message': '宏观指数已更新'})
+        return jsonify({'success': False, 'message': '暂无政策与市场环境数据，请先刷新右侧政策新闻或等待定时更新'}), 400
+    except Exception as e:
+        logger.exception('refresh_macro_index_api')
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
 @app.route('/api/test-data', methods=['POST', 'OPTIONS'])
 @token_required
 def add_test_data(current_user_id):
@@ -1817,6 +1927,267 @@ def get_company(current_user_id, company_id):
     return jsonify(result)
 
 
+@app.route('/api/companies/<int:company_id>/risk-timeseries', methods=['GET', 'OPTIONS'])
+@token_required
+def get_company_risk_timeseries(current_user_id, company_id):
+    """返回指定企业近期风险时间序列（供前端画历史风险趋势图）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    days = request.args.get('days', '').strip()
+    try:
+        days_int = int(days) if days else 90
+    except ValueError:
+        days_int = 90
+    days_int = max(7, min(365, days_int))
+
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    # 权限检查：只允许访问自己关联的企业
+    cids = _user_company_ids(cursor, current_user_id)
+    if company_id not in cids:
+        conn.close()
+        return jsonify({'message': '无权限访问该企业'}), 403
+
+    cursor.execute(
+        """
+        SELECT ts_date, score_legal, score_business, score_media,
+               score_policy, score_industry, risk_score,
+               news_count, neg_news_ratio, sentiment_index, sentiment_vol, policy_impact
+        FROM enterprise_risk_timeseries
+        WHERE enterprise_id=?
+        ORDER BY ts_date DESC
+        LIMIT ?
+        """,
+        (company_id, days_int),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    # 前端画图更习惯时间正序，这里反转
+    rows = rows[::-1]
+    out = []
+    for r in rows:
+        out.append({
+            'date': r[0],
+            'score_legal': r[1],
+            'score_business': r[2],
+            'score_media': r[3],
+            'score_policy': r[4],
+            'score_industry': r[5],
+            'risk_score': r[6],
+            'news_count': r[7],
+            'neg_news_ratio': r[8],
+            'sentiment_index': r[9],
+            'sentiment_vol': r[10],
+            'policy_impact': r[11],
+        })
+    return jsonify(out)
+
+
+@app.route('/api/v1/predict/risk', methods=['POST', 'OPTIONS'])
+@token_required
+def predict_risk(current_user_id):
+    """
+    风险预测接口（阶段 1：简单时间序列外推）。
+    请求体：
+    {
+      "enterprise_id": 1,
+      "horizon_days": 30
+    }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    enterprise_id = data.get('enterprise_id')
+    if not enterprise_id:
+        return jsonify({'message': 'enterprise_id 必填'}), 400
+    try:
+        enterprise_id = int(enterprise_id)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'enterprise_id 非法'}), 400
+
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    cids = _user_company_ids(cursor, current_user_id)
+    if enterprise_id not in cids:
+        conn.close()
+        return jsonify({'message': '无权限访问该企业'}), 403
+    conn.close()
+
+    horizon_days = data.get('horizon_days') or 30
+    try:
+        horizon_days = int(horizon_days)
+    except (TypeError, ValueError):
+        horizon_days = 30
+    horizon_days = max(7, min(90, horizon_days))
+
+    try:
+        from backend.services import prediction_service as ps
+        ps.DB_PATH = _DB_PATH
+        result = ps.predict_risk_for_enterprise(enterprise_id, horizon_days=horizon_days)
+        return jsonify(result)
+    except Exception as e:
+        logger.exception('predict_risk error')
+        return jsonify({'message': '预测失败', 'error': str(e)}), 500
+
+
+@app.route('/api/v1/predict/backtest', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+def predict_backtest(current_user_id):
+    """
+    运行预测回测，得到 MAE、RMSE、方向准确率、相对朴素基准提升、残差标准差等，
+    用于评估准确性并为预测区间提供依据。结果会写入 backtest_metrics 表。
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    lookback = request.args.get('lookback_days', 30)
+    horizon = request.args.get('horizon_days', 7)
+    try:
+        lookback = int(lookback)
+        horizon = int(horizon)
+    except (TypeError, ValueError):
+        lookback, horizon = 30, 7
+    lookback = max(7, min(90, lookback))
+    horizon = max(1, min(90, horizon))
+    try:
+        from backend.services import backtest_service as bts
+        bts.DB_PATH = _DB_PATH
+        result = bts.run_backtest(lookback_days=lookback, horizon_days=horizon, db_path=_DB_PATH)
+        return jsonify(result)
+    except Exception as e:
+        logger.exception('predict_backtest error')
+        return jsonify({'error': str(e)}), 500
+
+
+def _run_company_crawl_and_news_pipeline(company_id, company_name, current_user_id):
+    """单企业全流程：工商信息 + 相关新闻搜索 + 媒体舆情爬取。供添加企业、批量导入、重新爬取共用。"""
+    try:
+        from backend.services.crawler import fetch_company_info, trigger_media_crawl
+        from backend.services.llm_service import fetch_company_info_by_llm
+        name = company_name
+        c0 = _db_conn()
+        cur0 = c0.cursor()
+        cur0.execute("UPDATE companies SET llm_status='running', news_status='pending', media_status='pending' WHERE id=?", (company_id,))
+        cur0.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
+        llm_row = cur0.fetchone()
+        api_key = base_url = model = None
+        enable_web_search = False
+        if llm_row:
+            api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
+            enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
+        c0.commit()
+        c0.close()
+        if not api_key or not str(api_key).strip():
+            print('[工商信息] 未配置 LLM API，使用 enterprise_crawler 模拟数据')
+        else:
+            print('[工商信息] 使用 LLM 联网搜索，base_url=%s model=%s enable_web=%s' % (base_url or '(默认)', model, enable_web_search))
+
+        info = None
+        llm_ok = False
+        if api_key:
+            llm_info = fetch_company_info_by_llm(name, api_key, base_url, model, enable_web_search=enable_web_search)
+            if llm_info:
+                print('[工商信息] LLM 返回字段:', list(llm_info.keys()) if llm_info else 'None')
+                llm_ok = True
+                info = {}
+                for k, v in llm_info.items():
+                    if v is None:
+                        continue
+                    if isinstance(v, (list, dict)):
+                        info[k] = json.dumps(v, ensure_ascii=False) if v else ''
+                    elif v not in ('-', '', '无', '未知'):
+                        info[k] = str(v).strip()
+                    else:
+                        info.setdefault(k, '')
+                for f in ('legal_representative','registered_capital','registered_address','industry','business_status','business_scope','equity_structure','established_date','legal_cases','equity_changes','capital_changes'):
+                    info.setdefault(f, '')
+        if info is None:
+            info = fetch_company_info(name)
+            print('[工商信息] 使用 enterprise_crawler 回退，info keys:', list(info.keys()) if info else 'None')
+
+        c1 = _db_conn()
+        cur1 = c1.cursor()
+        cur1.execute("""UPDATE companies SET legal_representative=?, registered_capital=?, business_status=?,
+            registered_address=?, business_scope=?, equity_structure=?, established_date=?,
+            legal_cases=?, equity_changes=?, capital_changes=?,
+            industry=COALESCE(NULLIF(industry,''),?), crawl_status='crawled', llm_status=?, last_updated=? WHERE id=?""",
+            (info.get('legal_representative',''), info.get('registered_capital',''), info.get('business_status',''),
+             info.get('registered_address',''), info.get('business_scope',''), info.get('equity_structure',''),
+             info.get('established_date',''), info.get('legal_cases',''), info.get('equity_changes',''), info.get('capital_changes',''),
+             info.get('industry',''), 'success' if llm_ok or info else 'error', datetime.now().isoformat(), company_id))
+        c1.commit()
+        c1.close()
+
+        c2a = _db_conn()
+        c2a.cursor().execute("UPDATE companies SET news_status='running' WHERE id=?", (company_id,))
+        c2a.commit()
+        c2a.close()
+        news_list = None
+        try:
+            if api_key and str(api_key).strip():
+                from backend.services.llm_service import search_company_news
+                news_list = search_company_news(name, api_key, base_url or '', model or 'gpt-4o-mini', enable_web_search=enable_web_search)
+        except Exception as ne:
+            print('[相关新闻] 搜索异常:', ne)
+        if news_list is not None:
+            c2b = _db_conn()
+            cur2 = c2b.cursor()
+            cur2.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
+            company_name_tag = (name or '').strip()
+            for n in (news_list or []):
+                rd = n.get('risk_dimensions') or {}
+                rl = n.get('risk_level', '中')
+                cur2.execute("""INSERT INTO company_news (company_id, company_tag, title, content, source, sentiment_score, risk_level, category, publish_date, risk_dimensions)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (company_id, company_name_tag, n.get('title', ''), n.get('summary', ''), n.get('source', ''),
+                     0.5, rl, n.get('category', '其他'), n.get('date', ''),
+                     json.dumps(rd, ensure_ascii=False)))
+                if (rl or '').strip() == '高':
+                    _create_risk_alert(cur2, company_id, 'news', 'high', (n.get('title') or '')[:200], n.get('source') or '')
+                    _notify_alert_created(c2b, company_id, 'news', 'high', (n.get('title') or '')[:200], company_name_tag)
+            cur2.execute("UPDATE companies SET news_status=? WHERE id=?", ('success', company_id))
+            c2b.commit()
+            c2b.close()
+            _sync_risk_pipeline_after_news(company_id)
+            print('[相关新闻] 已写入 %s 条' % len(news_list or []))
+        else:
+            c2c = _db_conn()
+            c2c.cursor().execute("UPDATE companies SET news_status=? WHERE id=?", ('error', company_id))
+            c2c.commit()
+            c2c.close()
+
+        c3 = _db_conn()
+        cur3 = c3.cursor()
+        cur3.execute("UPDATE companies SET social_evaluation=NULL WHERE id=?", (company_id,))
+        cur3.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
+        cur3.execute("UPDATE companies SET media_status='running' WHERE id=?", (company_id,))
+        c3.commit()
+        c3.close()
+
+        def _save_reviews(cid, reviews):
+            from backend.services.media_review_store import save_media_reviews_dedup
+            save_media_reviews_dedup(_DB_PATH, cid, name, reviews, api_key, base_url, model)
+        def _on_media_error(cid):
+            cx = _db_conn()
+            cx.cursor().execute("UPDATE companies SET media_status='error' WHERE id=?", (cid,))
+            cx.commit()
+            cx.close()
+        trigger_media_crawl(company_id, name, callback=_save_reviews, on_error=_on_media_error)
+    except Exception as e:
+        print('Crawl error:', e)
+        try:
+            cx = _db_conn()
+            cu = cx.cursor()
+            for col, val in [('llm_status', 'error'), ('media_status', 'error'), ('news_status', 'error')]:
+                try:
+                    cu.execute("UPDATE companies SET %s=? WHERE id=?" % col, (val, company_id))
+                except sqlite3.OperationalError:
+                    pass
+            cx.commit()
+            cx.close()
+        except Exception:
+            pass
+
+
 @app.route('/api/companies', methods=['POST', 'OPTIONS'])
 @token_required
 def add_company(current_user_id):
@@ -1842,144 +2213,11 @@ def add_company(current_user_id):
         cursor.execute("INSERT OR IGNORE INTO user_companies (user_id, company_id) VALUES (?, ?)", (current_user_id, company_id))
         conn.commit()
         conn.close()
-        
-        def _crawl_and_update():
-            try:
-                from backend.services.crawler import fetch_company_info, trigger_media_crawl
-                from backend.services.llm_service import fetch_company_info_by_llm
-                # 步骤 0：更新状态，立即关闭连接，避免长时间持锁
-                c0 = _db_conn()
-                cur0 = c0.cursor()
-                cur0.execute("UPDATE companies SET llm_status='running', news_status='pending', media_status='pending' WHERE id=?", (company_id,))
-                cur0.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
-                llm_row = cur0.fetchone()
-                api_key = base_url = model = None
-                enable_web_search = False
-                if llm_row:
-                    api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
-                    enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
-                c0.commit()
-                c0.close()
-                if not api_key or not str(api_key).strip():
-                    print('[工商信息] 未配置 LLM API，使用 enterprise_crawler 模拟数据')
-                else:
-                    print('[工商信息] 使用 LLM 联网搜索，base_url=%s model=%s enable_web=%s' % (base_url or '(默认)', model, enable_web_search))
 
-                # 1) 企业工商信息：先调 LLM/爬虫（不持库连接），再写库
-                from backend.services.crawler import fetch_company_info
-                info = None
-                llm_ok = False
-                if api_key:
-                    llm_info = fetch_company_info_by_llm(name, api_key, base_url, model, enable_web_search=enable_web_search)
-                    if llm_info:
-                        print('[工商信息] LLM 返回字段:', list(llm_info.keys()) if llm_info else 'None')
-                        llm_ok = True
-                        info = {}
-                        for k, v in llm_info.items():
-                            if v is None:
-                                continue
-                            if isinstance(v, (list, dict)):
-                                info[k] = json.dumps(v, ensure_ascii=False) if v else ''
-                            elif v not in ('-', '', '无', '未知'):
-                                info[k] = str(v).strip()
-                            else:
-                                info.setdefault(k, '')
-                        for f in ('legal_representative','registered_capital','registered_address','industry','business_status','business_scope','equity_structure','established_date','legal_cases','equity_changes','capital_changes'):
-                            info.setdefault(f, '')
-                if info is None:
-                    info = fetch_company_info(name)
-                    print('[工商信息] 使用 enterprise_crawler 回退，info keys:', list(info.keys()) if info else 'None')
-
-                c1 = _db_conn()
-                cur1 = c1.cursor()
-                cur1.execute("""UPDATE companies SET legal_representative=?, registered_capital=?, business_status=?,
-                    registered_address=?, business_scope=?, equity_structure=?, established_date=?,
-                    legal_cases=?, equity_changes=?, capital_changes=?,
-                    industry=COALESCE(NULLIF(industry,''),?), crawl_status='crawled', llm_status=?, last_updated=? WHERE id=?""",
-                    (info.get('legal_representative',''), info.get('registered_capital',''), info.get('business_status',''),
-                     info.get('registered_address',''), info.get('business_scope',''), info.get('equity_structure',''),
-                     info.get('established_date',''), info.get('legal_cases',''), info.get('equity_changes',''), info.get('capital_changes',''),
-                     info.get('industry',''), 'success' if llm_ok or info else 'error', datetime.now().isoformat(), company_id))
-                c1.commit()
-                c1.close()
-
-                # 2) 大模型搜索相关新闻：先请求（不持库），再写库
-                c2a = _db_conn()
-                c2a.cursor().execute("UPDATE companies SET news_status='running' WHERE id=?", (company_id,))
-                c2a.commit()
-                c2a.close()
-                news_ok = False
-                news_list = None
-                try:
-                    if api_key and str(api_key).strip():
-                        from backend.services.llm_service import search_company_news
-                        news_list = search_company_news(name, api_key, base_url or '', model or 'gpt-4o-mini', enable_web_search=enable_web_search)
-                except Exception as ne:
-                    print('[相关新闻] 搜索异常:', ne)
-                if news_list is not None:
-                    c2b = _db_conn()
-                    cur2 = c2b.cursor()
-                    cur2.execute("DELETE FROM company_news WHERE company_id=?", (company_id,))
-                    company_name_tag = (name or '').strip()
-                    for n in (news_list or []):
-                        rd = n.get('risk_dimensions') or {}
-                        rl = n.get('risk_level', '中')
-                        cur2.execute("""INSERT INTO company_news (company_id, company_tag, title, content, source, sentiment_score, risk_level, category, publish_date, risk_dimensions)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                            (company_id, company_name_tag, n.get('title', ''), n.get('summary', ''), n.get('source', ''),
-                             0.5, rl, n.get('category', '其他'), n.get('date', ''),
-                             json.dumps(rd, ensure_ascii=False)))
-                        if (rl or '').strip() == '高':
-                            _create_risk_alert(cur2, company_id, 'news', 'high', (n.get('title') or '')[:200], n.get('source') or '')
-                            _notify_alert_created(c2b, company_id, 'news', 'high', (n.get('title') or '')[:200], company_name_tag)
-                    cur2.execute("UPDATE companies SET news_status=? WHERE id=?", ('success', company_id))
-                    c2b.commit()
-                    c2b.close()
-                    news_ok = True
-                    print('[相关新闻] 已写入 %s 条' % len(news_list or []))
-                else:
-                    c2c = _db_conn()
-                    c2c.cursor().execute("UPDATE companies SET news_status=? WHERE id=?", ('error', company_id))
-                    c2c.commit()
-                    c2c.close()
-
-                # 3) 媒体舆情：仅更新状态并触发爬虫，回调里会单独连库
-                c3 = _db_conn()
-                cur3 = c3.cursor()
-                cur3.execute("UPDATE companies SET social_evaluation=NULL WHERE id=?", (company_id,))
-                cur3.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
-                cur3.execute("UPDATE companies SET media_status='running' WHERE id=?", (company_id,))
-                c3.commit()
-                c3.close()
-
-                def _save_reviews(cid, reviews):
-                    from backend.services.media_review_store import save_media_reviews_dedup
-                    save_media_reviews_dedup(_DB_PATH, cid, name, reviews, api_key, base_url, model)
-                def _on_media_error(cid):
-                    cx = _db_conn()
-                    cx.cursor().execute("UPDATE companies SET media_status='error' WHERE id=?", (cid,))
-                    cx.commit()
-                    cx.close()
-                trigger_media_crawl(company_id, name, callback=_save_reviews, on_error=_on_media_error)
-            except Exception as e:
-                print('Crawl error:', e)
-                try:
-                    cx = _db_conn()
-                    cu = cx.cursor()
-                    for col, val in [('llm_status', 'error'), ('media_status', 'error'), ('news_status', 'error')]:
-                        try:
-                            cu.execute("UPDATE companies SET %s=? WHERE id=?" % col, (val, company_id))
-                        except sqlite3.OperationalError:
-                            pass
-                    cx.commit()
-                    cx.close()
-                except Exception:
-                    pass
-        
-        t = threading.Thread(target=_crawl_and_update)
+        t = threading.Thread(target=_run_company_crawl_and_news_pipeline, args=(company_id, name, current_user_id))
         t.daemon = True
         t.start()
-        
+
         return jsonify({
             'id': company_id,
             'name': name,
@@ -2104,82 +2342,11 @@ def trigger_company_crawl(current_user_id, company_id):
     conn.close()
     if not row:
         return jsonify({'message': 'Company not found'}), 404
-    try:
-        from backend.services.crawler import trigger_media_crawl
-        from backend.services.llm_service import analyze_sentiment_and_keywords, fetch_company_info_by_llm
-        db_path = _DB_PATH
-        conn2 = sqlite3.connect(db_path)
-        cur = conn2.cursor()
-        cur.execute("UPDATE companies SET llm_status='running', media_status='pending' WHERE id=?", (company_id,))
-        conn2.commit()
-        cur.execute("SELECT api_key, base_url, model, enable_web_search FROM llm_config WHERE user_id=?", (current_user_id,))
-        llm_row = cur.fetchone()
-        api_key = base_url = model = None
-        enable_web_search = False
-        if llm_row:
-            api_key, base_url, model = llm_row[0], llm_row[1], llm_row[2]
-            enable_web_search = bool(llm_row[3]) if len(llm_row) > 3 else False
-        # 企业工商、法律等信息：仅用大模型联网搜索
-        from backend.services.crawler import fetch_company_info
-        info = None
-        llm_ok = False
-        if api_key:
-            llm_info = fetch_company_info_by_llm(row[0], api_key, base_url, model, enable_web_search=enable_web_search)
-            if llm_info:
-                llm_ok = True
-                info = {}
-                for k, v in llm_info.items():
-                    if v is None:
-                        continue
-                    if isinstance(v, (list, dict)):
-                        info[k] = json.dumps(v, ensure_ascii=False) if v else ''
-                    elif v not in ('-', '', '无', '未知'):
-                        info[k] = str(v).strip()
-                    else:
-                        info.setdefault(k, '')
-                for f in ('legal_representative','registered_capital','registered_address','industry','business_status','business_scope','equity_structure','established_date','legal_cases','equity_changes','capital_changes'):
-                    info.setdefault(f, '')
-        if info is None:
-            info = fetch_company_info(row[0])
-        cur.execute("""UPDATE companies SET legal_representative=?, registered_capital=?, business_status=?,
-            registered_address=?, business_scope=?, equity_structure=?, established_date=?,
-            legal_cases=?, equity_changes=?, capital_changes=?,
-            industry=COALESCE(NULLIF(industry,''),?), crawl_status='crawled', llm_status=?, last_updated=? WHERE id=?""",
-            (info.get('legal_representative',''), info.get('registered_capital',''), info.get('business_status',''),
-             info.get('registered_address',''), info.get('business_scope',''), info.get('equity_structure',''),
-             info.get('established_date',''), info.get('legal_cases',''), info.get('equity_changes',''), info.get('capital_changes',''),
-             info.get('industry',''), 'success' if llm_ok or info else 'error', datetime.now().isoformat(), company_id))
-        conn2.commit()
-        # 开始媒体爬取前清空该企业旧的社会评价数据，避免搜集完成后仍显示上次内容
-        cur.execute("UPDATE companies SET social_evaluation=NULL WHERE id=?", (company_id,))
-        cur.execute("DELETE FROM company_media_reviews WHERE company_id=?", (company_id,))
-        cur.execute("UPDATE companies SET media_status='running' WHERE id=?", (company_id,))
-        conn2.commit()
-
-        def _save_reviews(cid, reviews):
-            from backend.services.media_review_store import save_media_reviews_dedup
-            save_media_reviews_dedup(db_path, cid, row[0], reviews, api_key, base_url, model)
-
-        def _on_media_error(cid):
-            c = sqlite3.connect(db_path)
-            cu = c.cursor()
-            cu.execute("UPDATE companies SET media_status='error' WHERE id=?", (cid,))
-            c.commit()
-            c.close()
-        trigger_media_crawl(company_id, row[0], callback=_save_reviews, on_error=_on_media_error)
-        conn2.close()
-    except Exception as e:
-        print('Trigger crawl error:', e)
-        try:
-            c = sqlite3.connect(db_path)
-            cu = c.cursor()
-            cu.execute("UPDATE companies SET llm_status=?, media_status=? WHERE id=?", ('error', 'error', company_id))
-            c.commit()
-            c.close()
-        except Exception:
-            pass
-        return jsonify({'message': str(e)}), 500
-    return jsonify({'message': '爬取任务已启动', 'crawl_status': 'started'})
+    # 与添加企业一致：后台执行工商信息 + 相关新闻搜索 + 媒体舆情爬取
+    t = threading.Thread(target=_run_company_crawl_and_news_pipeline, args=(company_id, row[0], current_user_id))
+    t.daemon = True
+    t.start()
+    return jsonify({'message': '爬取任务已启动（含工商信息、相关新闻与媒体舆情）', 'crawl_status': 'started'})
 
 @app.route('/api/companies/<int:company_id>/news-search', methods=['POST', 'OPTIONS'])
 @token_required
@@ -2234,6 +2401,7 @@ def search_company_news_api(current_user_id, company_id):
             pass
         conn2.commit()
         conn2.close()
+        _sync_risk_pipeline_after_news(company_id)
         return jsonify({'message': f'已更新该企业相关新闻，共 {len(news_list)} 条', 'count': len(news_list), 'news': news_list})
     except Exception as e:
         import traceback
@@ -3387,6 +3555,8 @@ def _analyze_and_classify_link(link_id, user_id, url, title, company_id):
                     cur.execute("INSERT OR IGNORE INTO company_keywords (company_id, keyword, weight) VALUES (?,?,1)", (cid, kw))
         conn.commit()
         conn.close()
+        if result.get('is_news') and cid:
+            _sync_risk_pipeline_after_news(cid)
     except Exception as e:
         print('[Link] analyze error:', e)
         try:
@@ -3613,6 +3783,8 @@ def _analyze_and_classify_document(doc_id, user_id, filepath, filename, company_
                     cur.execute("INSERT OR IGNORE INTO company_keywords (company_id, keyword, weight) VALUES (?,?,1)", (cid, kw))
         conn.commit()
         conn.close()
+        if result.get('is_news') and cid:
+            _sync_risk_pipeline_after_news(cid)
     except Exception as e:
         print('[Document] analyze error:', e)
         try:
@@ -3919,7 +4091,12 @@ def batch_import_companies(current_user_id):
     conn.commit()
     conn.close()
     _audit_log(current_user_id, 'batch_import', 'company', None, f'导入{len(created)}家')
-    return jsonify({'message': f'已导入 {len(created)} 家企业', 'created': created}), 201
+    # 为每家新企业自动启动与「添加企业」相同的流程：工商信息 + 相关新闻 + 媒体舆情爬取
+    for c in created:
+        t = threading.Thread(target=_run_company_crawl_and_news_pipeline, args=(c['id'], c['name'], current_user_id))
+        t.daemon = True
+        t.start()
+    return jsonify({'message': f'已导入 {len(created)} 家企业，后台正在自动爬取工商信息、相关新闻与媒体舆情', 'created': created}), 201
 
 
 # ---------- 备份与恢复 ----------
@@ -4245,6 +4422,389 @@ def admin_system_settings(current_user_id):
         out['smtp_password'] = '********' if os.environ.get('SMTP_PASSWORD') else ''
     return jsonify(out)
 
+
+@app.route('/api/admin/risk-labels', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_risk_labels(current_user_id):
+    """
+    管理企业风险标签：
+    - GET: 查询标签（可按 enterprise_id / label_type 过滤）
+    - POST: 写入或更新标签（INSERT OR REPLACE）
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    db_path = _DB_PATH
+    if request.method == 'GET':
+        enterprise_id = request.args.get('enterprise_id')
+        label_type = request.args.get('label_type')
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        sql = "SELECT id, enterprise_id, as_of_date, label_type, label_value, note, created_at FROM enterprise_risk_label WHERE 1=1"
+        params = []
+        if enterprise_id:
+            sql += " AND enterprise_id=?"
+            params.append(int(enterprise_id))
+        if label_type:
+            sql += " AND label_type=?"
+            params.append(label_type.strip())
+        sql += " ORDER BY as_of_date DESC, created_at DESC"
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+        conn.close()
+        out = []
+        for r in rows:
+            out.append({
+                'id': r[0],
+                'enterprise_id': r[1],
+                'as_of_date': r[2],
+                'label_type': r[3],
+                'label_value': r[4],
+                'note': r[5],
+                'created_at': r[6],
+            })
+        return jsonify(out)
+
+    # POST: 创建/更新标签
+    data = request.get_json() or {}
+    enterprise_id = data.get('enterprise_id')
+    as_of_date = (data.get('as_of_date') or '').strip()
+    label_type = (data.get('label_type') or 'explosion').strip()
+    label_value = data.get('label_value')
+    note = (data.get('note') or '').strip() or None
+
+    try:
+        enterprise_id = int(enterprise_id)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'enterprise_id 必须是数字'}), 400
+    if not as_of_date or len(as_of_date) < 10:
+        return jsonify({'message': 'as_of_date 必须是 YYYY-MM-DD'}), 400
+    try:
+        val = int(label_value)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'label_value 必须是 0 或 1'}), 400
+    if val not in (0, 1):
+        return jsonify({'message': 'label_value 必须是 0 或 1'}), 400
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO enterprise_risk_label
+            (id, enterprise_id, as_of_date, label_type, label_value, note, created_at)
+        VALUES (
+            (SELECT id FROM enterprise_risk_label WHERE enterprise_id=? AND as_of_date=? AND label_type=?),
+            ?, ?, ?, ?, ?, COALESCE(
+                (SELECT created_at FROM enterprise_risk_label WHERE enterprise_id=? AND as_of_date=? AND label_type=?),
+                CURRENT_TIMESTAMP
+            )
+        )
+        """,
+        (
+            enterprise_id, as_of_date, label_type,
+            enterprise_id, as_of_date, label_type, val, note,
+            enterprise_id, as_of_date, label_type,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    _audit_log(
+        current_user_id,
+        'admin_set_risk_label',
+        resource_type='enterprise',
+        resource_id=enterprise_id,
+        detail=f'{label_type}={val} on {as_of_date}',
+    )
+    return jsonify({'message': '已保存标签'})
+
+
+def _update_company_risk_level_from_news(conn, company_id):
+    """
+    根据该企业 company_news 的风险等级汇总更新 companies.risk_level，便于首页/详情页显示且无社会评价时不为「未知」。
+    若汇总结果为「高」且原等级非高，则写入一条风险警报。
+    """
+    if conn is None:
+        conn = _db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT risk_level FROM company_news WHERE company_id=? AND risk_level IN ('高','中','低')",
+        (company_id,),
+    )
+    levels = [row[0].strip() for row in cur.fetchall() if row and row[0]]
+    if not levels:
+        return
+    order = {'高': 3, '中': 2, '低': 1}
+    derived = max(levels, key=lambda x: order.get(x, 0))
+    cur.execute("SELECT risk_level FROM companies WHERE id=?", (company_id,))
+    row = cur.fetchone()
+    old_level = (row[0] or '').strip() if row else ''
+    cur.execute("UPDATE companies SET risk_level=? WHERE id=?", (derived, company_id))
+    if derived == '高' and old_level != '高':
+        _create_risk_alert(cur, company_id, 'company', 'high', '企业相关新闻存在高风险，已更新风险等级', 'news_aggregate')
+    conn.commit()
+
+
+def _sync_risk_pipeline_after_news(company_id=None):
+    """company_news 有新数据写入后，自动更新该企业（或全库）的事件特征与时间序列，并依新闻汇总更新企业风险等级。"""
+    try:
+        from backend.services import feature_extraction_service as fes
+        from backend.services import risk_timeseries_service as rts
+        fes.DB_PATH = _DB_PATH
+        rts.DB_PATH = _DB_PATH
+        fes.rebuild_news_features(db_path=_DB_PATH, enterprise_id=company_id)
+        if company_id is not None:
+            rts.rebuild_timeseries_for_enterprise(company_id, db_path=_DB_PATH)
+            conn = _db_conn()
+            try:
+                _update_company_risk_level_from_news(conn, company_id)
+            finally:
+                conn.close()
+        else:
+            conn = _db_conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM companies")
+                cids = [row[0] for row in cur.fetchall()]
+                for cid in cids:
+                    rts.rebuild_timeseries_for_enterprise(cid, db_path=_DB_PATH)
+                    _update_company_risk_level_from_news(conn, cid)
+            finally:
+                conn.close()
+    except Exception as e:
+        logger.exception('_sync_risk_pipeline_after_news error: %s', e)
+
+
+@app.route('/api/admin/rebuild_features', methods=['POST', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_rebuild_features(current_user_id):
+    """管理员触发：从 company_news 重建企业事件特征（enterprise_event_feature）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    enterprise_id = data.get('enterprise_id')
+    try:
+        from backend.services import feature_extraction_service as fes
+        fes.DB_PATH = _DB_PATH
+        count = fes.rebuild_news_features(enterprise_id=enterprise_id)
+        conn = _db_conn()
+        try:
+            if enterprise_id is not None:
+                _update_company_risk_level_from_news(conn, int(enterprise_id))
+            else:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM companies")
+                for row in cur.fetchall():
+                    _update_company_risk_level_from_news(conn, row[0])
+        finally:
+            conn.close()
+        _audit_log(
+            current_user_id,
+            'admin_rebuild_features',
+            resource_type='enterprise' if enterprise_id else 'all',
+            resource_id=enterprise_id,
+            detail=f'news_features={count}',
+        )
+        return jsonify({'message': '重建完成', 'news_event_count': count})
+    except Exception as e:
+        logger.exception('admin_rebuild_features error')
+        return jsonify({'message': '重建失败', 'error': str(e)}), 500
+
+
+@app.route('/api/admin/db/tables', methods=['GET', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_db_tables(current_user_id):
+    """管理员：列出 SQLite 中所有表名（仅 table 类型，排除 sqlite_sequence 等）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    try:
+        conn = _db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        tables = [row[0] for row in cur.fetchall()]
+        conn.close()
+        return jsonify({'tables': tables})
+    except Exception as e:
+        logger.exception('admin_db_tables error')
+        return jsonify({'message': str(e), 'tables': []}), 500
+
+
+def _safe_table_name(name):
+    """只允许字母、数字、下划线，防止 SQL 注入。"""
+    if not name or not isinstance(name, str):
+        return None
+    s = name.strip()
+    return s if s and s.replace('_', '').isalnum() else None
+
+
+@app.route('/api/admin/db/table/<table_name>', methods=['GET', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_db_table_data(current_user_id, table_name):
+    """管理员：查看指定表的结构与数据（分页，只读）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    safe_name = _safe_table_name(table_name)
+    if not safe_name:
+        return jsonify({'message': '无效表名'}), 400
+    limit = min(500, max(1, request.args.get('limit', type=int) or 100))
+    offset = max(0, request.args.get('offset', type=int) or 0)
+    try:
+        conn = _db_conn()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (safe_name,))
+        if not cur.fetchone():
+            conn.close()
+            return jsonify({'message': '表不存在'}), 404
+        cur.execute("PRAGMA table_info(%s)" % safe_name)
+        columns = [{'name': row[1], 'type': row[2], 'pk': bool(row[5])} for row in cur.fetchall()]
+        cur.execute("SELECT COUNT(*) FROM %s" % safe_name)
+        total = cur.fetchone()[0]
+        cur.execute("SELECT * FROM %s LIMIT ? OFFSET ?" % safe_name, (limit, offset))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return jsonify({
+            'table': safe_name,
+            'columns': columns,
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+            'rows': rows,
+        })
+    except Exception as e:
+        logger.exception('admin_db_table_data error')
+        return jsonify({'message': str(e)}), 500
+
+
+def _get_table_columns_and_pk(cursor, safe_name):
+    """返回 (columns_list, pk_column_name)。pk_column_name 可能为 None。"""
+    cursor.execute("PRAGMA table_info(%s)" % safe_name)
+    rows = cursor.fetchall()
+    cols = [row[1] for row in rows]
+    pk = None
+    for row in rows:
+        if row[5]:  # pk
+            pk = row[1]
+            break
+    return cols, pk
+
+
+@app.route('/api/admin/db/table/<table_name>/row', methods=['POST', 'PUT', 'DELETE', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_db_table_row(current_user_id, table_name):
+    """管理员：增改删单行。POST=插入，PUT=按主键更新，DELETE=按主键删除。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    safe_name = _safe_table_name(table_name)
+    if not safe_name:
+        return jsonify({'message': '无效表名'}), 400
+    try:
+        conn = _db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (safe_name,))
+        if not cur.fetchone():
+            conn.close()
+            return jsonify({'message': '表不存在'}), 404
+        columns, pk = _get_table_columns_and_pk(cur, safe_name)
+        data = request.get_json() or {}
+
+        if request.method == 'POST':
+            # 插入：只接受表中存在的列，主键若为 AUTOINCREMENT 可省略
+            row = data.get('row') if isinstance(data.get('row'), dict) else data
+            cols = [c for c in row.keys() if c in columns]
+            if not cols:
+                conn.close()
+                return jsonify({'message': '请提供至少一列有效字段'}), 400
+            placeholders = ','.join('?' * len(cols))
+            col_list = ','.join(cols)
+            cur.execute(
+                "INSERT INTO %s (%s) VALUES (%s)" % (safe_name, col_list, placeholders),
+                [row[c] for c in cols]
+            )
+            conn.commit()
+            rid = cur.lastrowid
+            conn.close()
+            return jsonify({'message': '已插入', 'id': rid})
+
+        if request.method == 'PUT':
+            if not pk:
+                conn.close()
+                return jsonify({'message': '该表无主键，无法按行更新'}), 400
+            pk_val = data.get('id') or data.get(pk)
+            if pk_val is None:
+                conn.close()
+                return jsonify({'message': '请提供主键值 (id 或 %s)' % pk}), 400
+            row = data.get('row') if isinstance(data.get('row'), dict) else data
+            cols = [c for c in row.keys() if c in columns and c != pk]
+            if not cols:
+                conn.close()
+                return jsonify({'message': '请提供要更新的列'}), 400
+            set_clause = ','.join("%s=?" % c for c in cols)
+            cur.execute(
+                "UPDATE %s SET %s WHERE %s=?" % (safe_name, set_clause, pk),
+                [row[c] for c in cols] + [pk_val]
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({'message': '已更新', 'rows': cur.rowcount})
+
+        if request.method == 'DELETE':
+            if not pk:
+                conn.close()
+                return jsonify({'message': '该表无主键，无法按行删除'}), 400
+            pk_val = data.get('id') or data.get(pk)
+            if pk_val is None:
+                conn.close()
+                return jsonify({'message': '请提供主键值 (id 或 %s)' % pk}), 400
+            cur.execute("DELETE FROM %s WHERE %s=?" % (safe_name, pk), (pk_val,))
+            conn.commit()
+            conn.close()
+            return jsonify({'message': '已删除', 'rows': cur.rowcount})
+    except Exception as e:
+        logger.exception('admin_db_table_row error')
+        return jsonify({'message': str(e)}), 500
+
+
+@app.route('/api/admin/rebuild_risk_timeseries', methods=['POST', 'OPTIONS'])
+@token_required
+@admin_required
+def admin_rebuild_risk_timeseries(current_user_id):
+    """管理员触发：从 enterprise_event_feature 重建企业风险时间序列（enterprise_risk_timeseries）。"""
+    if request.method == 'OPTIONS':
+        return jsonify({})
+    data = request.get_json() or {}
+    enterprise_id = data.get('enterprise_id')
+    try:
+        from backend.services import risk_timeseries_service as rts
+        rts.DB_PATH = _DB_PATH
+        total = 0
+        if enterprise_id:
+            total = rts.rebuild_timeseries_for_enterprise(int(enterprise_id))
+        else:
+            conn = sqlite3.connect(_DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM companies")
+            ids = [row[0] for row in cur.fetchall()]
+            conn.close()
+            for cid in ids:
+                total += rts.rebuild_timeseries_for_enterprise(cid)
+        _audit_log(
+            current_user_id,
+            'admin_rebuild_risk_timeseries',
+            resource_type='enterprise' if enterprise_id else 'all',
+            resource_id=enterprise_id,
+            detail=f'days_written={total}',
+        )
+        return jsonify({'message': '重建完成', 'days_written': total})
+    except Exception as e:
+        logger.exception('admin_rebuild_risk_timeseries error')
+        return jsonify({'message': '重建失败', 'error': str(e)}), 500
+
 # Media crawler integration routes (simplified version)
 try:
     from simple_media_integration import crawl_company_risks_simple, simple_media_crawler
@@ -4413,16 +4973,6 @@ if _standalone_mode:
         return 'Frontend index.html not found', 404
 
 
-if __name__ == '__main__':
-    _secret = app.config.get('SECRET_KEY') or ''
-    if _secret == 'your-secret-key-change-in-production' or (isinstance(_secret, str) and len(_secret) < 20):
-        logger.warning(
-            'SECRET_KEY 仍为默认或过短，生产环境请设置强随机密钥。'
-            '可运行: python backend/scripts/generate_secret_key.py'
-        )
-    run_standalone_server()
-
-
 def run_standalone_server():
     """独立运行时的服务入口（init_db、定时任务、Flask）。供桌面窗口启动器在子线程中调用。"""
     if not os.environ.get('SKIP_DROP_TABLES') and os.environ.get('FLASK_ENV') != 'production':
@@ -4453,3 +5003,13 @@ def run_standalone_server():
             webbrowser.open(f'http://127.0.0.1:{port}/')
         threading.Thread(target=_open_browser, daemon=True).start()
     app.run(debug=debug, port=port, host=host, use_reloader=False)
+
+
+if __name__ == '__main__':
+    _secret = app.config.get('SECRET_KEY') or ''
+    if _secret == 'your-secret-key-change-in-production' or (isinstance(_secret, str) and len(_secret) < 20):
+        logger.warning(
+            'SECRET_KEY 仍为默认或过短，生产环境请设置强随机密钥。'
+            '可运行: python backend/scripts/generate_secret_key.py'
+        )
+    run_standalone_server()

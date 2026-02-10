@@ -12,7 +12,11 @@ import subprocess
 import glob
 import shutil
 import time
+import threading
 from datetime import datetime
+
+# 同一时间只运行一个 MediaCrawler 爬取任务，避免陆续添加多企业时浏览器锁冲突
+_crawl_lock = threading.Lock()
 
 # 每次从环境变量读取，避免 .env 在模块导入之后才加载导致读不到
 def _get_path():
@@ -99,6 +103,26 @@ def is_available():
     """检查 MediaCrawler 是否可用"""
     path = _get_path()
     return _main_py_rel(path) is not None
+
+
+def is_platform_logged_in(platform=None):
+    """
+    检查当前平台是否已有登录态（扫码成功或已上传 session/cookie）。
+    未登录时不应启动爬取，否则会弹出登录二维码且长时间无结果。
+    """
+    platform = platform or _get_platform()
+    our_sessions = os.path.join(get_sessions_dir(), platform)
+    marker_file = os.path.join(our_sessions, 'logged_in.txt')
+    if os.path.isfile(marker_file):
+        return True
+    ignore_files = {'login_stderr.log'}
+    if os.path.isdir(our_sessions):
+        if any(f for f in os.listdir(our_sessions) if not f.startswith('.') and f not in ignore_files):
+            return True
+    # 兼容 path 为文件（如上传的 cookie 文件）
+    if os.path.isfile(our_sessions) or os.path.isfile(our_sessions + '.json'):
+        return True
+    return False
 
 
 def _platform_label(platform):
@@ -263,6 +287,14 @@ def crawl_by_keyword(company_name, platform=None, callback=None, company_id=None
     # 使用用户上传的登录态（若有）
     _copy_uploaded_sessions_to_mediacrawler(platform)
     
+    # 未登录时不启动爬取，避免每次新增企业都弹出小红书登录二维码且长时间无结果
+    if not is_platform_logged_in(platform):
+        return {
+            'status': 'no_content',
+            'message': '请先在系统设置→平台登录中完成小红书扫码（或上传 Cookie）后再爬取；未登录时不会启动爬虫，避免弹出登录窗口。',
+            'reviews': [],
+        }
+    
     # 会话目录与 app 一致，.app 下使用 RISKGUARD_DATA_DIR，否则使用项目 data/
     our_sessions = os.path.join(get_sessions_dir(), platform)
     # 若存在「内嵌扫码登录」的 marker，爬取时使用 Playwright 以复用 browser_data 中的会话
@@ -410,30 +442,14 @@ runpy.run_path(rel, run_name="__main__")
                 except Exception:
                     pass
 
-    _clear_browser_lock()
-    proc = None
-    last_error = None
-    for attempt in range(2):
-        if attempt == 1:
-            _clear_browser_lock()
-            time.sleep(2)
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=mc_path,
-                env=env,
-                capture_output=True,
-                timeout=_get_timeout(),
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-            )
-            break
-        except FileNotFoundError:
-            if getattr(sys, 'frozen', False):
-                _remove_keyword_file()
-                return {'status': 'error', 'message': 'MediaCrawler 执行失败（可执行文件未找到）', 'reviews': []}
-            cmd = ['python3', 'main.py'] + args
+    with _crawl_lock:
+        _clear_browser_lock()
+        proc = None
+        last_error = None
+        for attempt in range(2):
+            if attempt == 1:
+                _clear_browser_lock()
+                time.sleep(2)
             try:
                 proc = subprocess.run(
                     cmd,
@@ -446,59 +462,76 @@ runpy.run_path(rel, run_name="__main__")
                     errors='replace',
                 )
                 break
-            except Exception as e:
+            except FileNotFoundError:
+                if getattr(sys, 'frozen', False):
+                    _remove_keyword_file()
+                    return {'status': 'error', 'message': 'MediaCrawler 执行失败（可执行文件未找到）', 'reviews': []}
+                cmd = ['python3', 'main.py'] + args
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=mc_path,
+                        env=env,
+                        capture_output=True,
+                        timeout=_get_timeout(),
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                    )
+                    break
+                except Exception as e:
+                    _remove_keyword_file()
+                    return {'status': 'error', 'message': '执行 MediaCrawler 失败: %s' % e, 'reviews': []}
+            except subprocess.TimeoutExpired:
                 _remove_keyword_file()
-                return {'status': 'error', 'message': '执行 MediaCrawler 失败: %s' % e, 'reviews': []}
-        except subprocess.TimeoutExpired:
+                return {'status': 'timeout', 'message': '爬取超时（%s 秒）' % _get_timeout(), 'reviews': []}
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    continue
+                _remove_keyword_file()
+                msg = str(e)
+                if 'SingletonLock' in msg or 'File exists' in msg or 'SingletonCookie' in msg:
+                    msg += ' 请关闭所有 Chrome 窗口后重试；若已关闭仍报错，请在系统设置中清除登录态后重新扫码。'
+                return {'status': 'error', 'message': msg, 'reviews': []}
+        if proc is None:
             _remove_keyword_file()
-            return {'status': 'timeout', 'message': '爬取超时（%s 秒）' % _get_timeout(), 'reviews': []}
-        except Exception as e:
-            last_error = e
-            if attempt == 0:
-                continue
-            _remove_keyword_file()
-            msg = str(e)
-            if 'SingletonLock' in msg or 'File exists' in msg or 'SingletonCookie' in msg:
-                msg += ' 请关闭所有 Chrome 窗口后重试；若已关闭仍报错，请在系统设置中清除登录态后重新扫码。'
-            return {'status': 'error', 'message': msg, 'reviews': []}
-    if proc is None:
-        _remove_keyword_file()
-        return {'status': 'error', 'message': last_error and str(last_error) or '爬取启动失败', 'reviews': []}
+            return {'status': 'error', 'message': last_error and str(last_error) or '爬取启动失败', 'reviews': []}
 
-    # 优先只解析本次爬取新写入的 JSON（min_mtime），避免混入历史数据
-    reviews = _parse_json_output(save_path, platform, company_name, min_mtime=crawl_start)
-    if not reviews:
-        mc_data_path = os.path.join(_get_path(), 'data', platform)
-        reviews = _parse_json_output(mc_data_path, platform, company_name, min_mtime=crawl_start)
-    # 若按时间未拿到数据，回退：解析全部文件再按关键词过滤（兼容写入延迟或路径差异）
-    if not reviews:
-        reviews = _parse_json_output(save_path, platform, company_name, min_mtime=0)
+        # 优先只解析本次爬取新写入的 JSON（min_mtime），避免混入历史数据
+        reviews = _parse_json_output(save_path, platform, company_name, min_mtime=crawl_start)
         if not reviews:
-            reviews = _parse_json_output(mc_data_path, platform, company_name, min_mtime=0)
-        if reviews:
-            reviews = _filter_reviews_by_keyword(reviews, keyword)
-    elif len(reviews) > 20:
-        filtered = _filter_reviews_by_keyword(reviews, keyword)
-        if filtered:
-            reviews = filtered
-    
-    if not reviews:
+            mc_data_path = os.path.join(_get_path(), 'data', platform)
+            reviews = _parse_json_output(mc_data_path, platform, company_name, min_mtime=crawl_start)
+        # 若按时间未拿到数据，回退：解析全部文件再按关键词过滤（兼容写入延迟或路径差异）
+        if not reviews:
+            reviews = _parse_json_output(save_path, platform, company_name, min_mtime=0)
+            if not reviews:
+                reviews = _parse_json_output(mc_data_path, platform, company_name, min_mtime=0)
+            if reviews:
+                reviews = _filter_reviews_by_keyword(reviews, keyword)
+        elif len(reviews) > 20:
+            filtered = _filter_reviews_by_keyword(reviews, keyword)
+            if filtered:
+                reviews = filtered
+
+        if not reviews:
+            _remove_keyword_file()
+            stderr_snippet = (getattr(proc, 'stderr', None) or '')[-1500:].strip() if proc else ''
+            msg = '未解析到有效内容，请先扫码登录小红书（或当前平台）后再测试。可在本机运行 MediaCrawler 扫码后，在系统设置中上传 Cookie/Session。'
+            if stderr_snippet and ('SingletonLock' in stderr_snippet or 'File exists' in stderr_snippet):
+                msg += ' 若曾出现浏览器占用提示，请关闭所有 Chrome 窗口后重试。'
+            return {'status': 'no_content', 'message': msg, 'reviews': [], 'crawl_stderr': stderr_snippet}
+
+        if callback and company_id is not None:
+            callback(company_id, reviews)
+
         _remove_keyword_file()
-        stderr_snippet = (getattr(proc, 'stderr', None) or '')[-1500:].strip() if proc else ''
-        msg = '未解析到有效内容，请先扫码登录小红书（或当前平台）后再测试。可在本机运行 MediaCrawler 扫码后，在系统设置中上传 Cookie/Session。'
-        if stderr_snippet and ('SingletonLock' in stderr_snippet or 'File exists' in stderr_snippet):
-            msg += ' 若曾出现浏览器占用提示，请关闭所有 Chrome 窗口后重试。'
-        return {'status': 'no_content', 'message': msg, 'reviews': [], 'crawl_stderr': stderr_snippet}
-    
-    if callback and company_id is not None:
-        callback(company_id, reviews)
-    
-    _remove_keyword_file()
-    return {
-        'status': 'ok',
-        'message': f'爬取完成，共 {len(reviews)} 条',
-        'reviews': reviews,
-    }
+        return {
+            'status': 'ok',
+            'message': f'爬取完成，共 {len(reviews)} 条',
+            'reviews': reviews,
+        }
 
 
 def crawl_multi_platform(company_name, platforms=None, callback=None, company_id=None):

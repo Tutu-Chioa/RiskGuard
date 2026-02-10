@@ -102,6 +102,17 @@ def refresh_all_companies():
                          analysis.get('sentiment_score',0), analysis.get('risk_level',''), analysis.get('category',''),
                          json.dumps(analysis.get('keywords',[]), ensure_ascii=False), n.get('publish_date','')))
 
+                # 新闻入库后自动更新事件特征与时间序列
+                try:
+                    from backend.services import feature_extraction_service as fes
+                    from backend.services import risk_timeseries_service as rts
+                    fes.DB_PATH = DB_PATH
+                    rts.DB_PATH = DB_PATH
+                    fes.rebuild_news_features(db_path=DB_PATH, enterprise_id=cid)
+                    rts.rebuild_timeseries_for_enterprise(cid, db_path=DB_PATH)
+                except Exception as sync_err:
+                    print('Scheduler sync risk pipeline error:', cid, sync_err)
+
                 # 定时媒体舆情爬取：基于关键词搜索，入库时按 (company_id, platform, title) 去重，只插入新条目
                 try:
                     from backend.services.crawler import trigger_media_crawl
@@ -188,6 +199,13 @@ def refresh_macro_policy_news():
         conn.commit()
         conn.close()
         print('refresh_macro_policy_news: 已写入 %d 条' % len(items))
+        try:
+            from backend.services import macro_index_service as mis
+            mis.DB_PATH = DB_PATH
+            if mis.compute_and_save_macro_index(DB_PATH):
+                print('refresh_macro_policy_news: 已更新宏观指数 macro_daily_index')
+        except Exception as ex:
+            print('refresh_macro_policy_news: 更新宏观指数失败', ex)
     except Exception as e:
         print('refresh_macro_policy_news error:', e)
 
